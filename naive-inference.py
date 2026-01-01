@@ -90,7 +90,7 @@ def generate(model, tokenizer, prompt, max_new_tokens=50, temperature=1.0, top_k
 
         # Stop if EOS token
         if tokenizer.eos_token_id and next_token.item() == tokenizer.eos_token_id:
-          break
+            break
 
     total_time = time.perf_counter() - start_time
     print("\n" + "-" * 80)
@@ -120,11 +120,11 @@ def compute_metrics(token_times, total_time, num_tokens):
     ttft = token_times[0] * 1000  # Convert to ms
 
     if len(token_times) > 1:
-      sorted_times = sorted(token_times[1:])
-      itl_mean = sum(token_times[1:]) / len(token_times[1:]) * 1000
-      itl_p50 = sorted_times[len(sorted_times) // 2] * 1000
-      itl_p99_idx = min(int(len(sorted_times) * 0.99), len(sorted_times) - 1)
-      itl_p99 = sorted_times[itl_p99_idx] * 1000
+        sorted_times = sorted(token_times[1:])
+        itl_mean = sum(token_times[1:]) / len(token_times[1:]) * 1000
+        itl_p50 = sorted_times[len(sorted_times) // 2] * 1000
+        itl_p99_idx = min(int(len(sorted_times) * 0.99), len(sorted_times) - 1)
+        itl_p99 = sorted_times[itl_p99_idx] * 1000
     else:
         itl_mean = itl_p50 = itl_p99 = 0
 
