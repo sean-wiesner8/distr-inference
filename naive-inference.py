@@ -11,15 +11,19 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 def load_model(model_name="TinyLlama/TinyLlama-1.1B-Chat-v1.0"):
     """Load model and tokenizer."""
     print(f"Loading model: {model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.bfloat16,
-        device_map="auto"
-    )
-    model.eval()
-    print("Model loaded successfully")
-    return model, tokenizer
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.bfloat16,
+            device_map="auto"
+        )
+        model.eval()
+        print("Model loaded successfully")
+        return model, tokenizer
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        raise
 
 
 def sample_token(logits, temperature=1.0, top_k=50):
