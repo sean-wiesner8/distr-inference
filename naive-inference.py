@@ -3,18 +3,19 @@ Bare bones single-GPU inference pipeline without KV cache.
 Implements basic autoregressive generation.
 """
 
+import time
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 
-def load_model(model_name="mistralai/Mistral-7B-v0.1"):
+def load_model(model_name="TinyLlama/TinyLlama-1.1B-Chat-v1.0"):
     """Load model and tokenizer."""
     print(f"Loading model: {model_name}")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.bfloat16,
-        device_map="cuda"
+        device_map="auto"
     )
     model.eval()
     print("Model loaded successfully")
@@ -38,10 +39,17 @@ def sample_token(logits, temperature=1.0, top_k=50):
     return next_token
 
 
-def generate(model, tokenizer, prompt, max_new_tokens=50, temperature=1.0, top_k=50):
+def generate(model, tokenizer, prompt, max_new_tokens=50, temperature=1.0, top_k=50, benchmark=False):
     """
     Autoregressive generation loop.
     Forward pass → sample token → append to sequence → repeat
+
+    Args:
+        benchmark: If True, collect and return timing metrics (TTFT, ITL)
+
+    Returns:
+        If benchmark=False: generated_text (str)
+        If benchmark=True: (generated_text, metrics_dict)
     """
     # Tokenize input
     input_ids = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
@@ -50,8 +58,14 @@ def generate(model, tokenizer, prompt, max_new_tokens=50, temperature=1.0, top_k
     print(f"Prompt: {prompt}")
     print("-" * 80)
 
+    # Benchmark metrics
+    token_times = []
+    start_time = time.perf_counter()
+
     # Generation loop
     for i in range(max_new_tokens):
+        iter_start = time.perf_counter()
+
         # Forward pass through entire sequence (no KV cache)
         with torch.no_grad():
             outputs = model(input_ids)
@@ -63,39 +77,105 @@ def generate(model, tokenizer, prompt, max_new_tokens=50, temperature=1.0, top_k
         # Append to sequence
         input_ids = torch.cat([input_ids, next_token], dim=-1)
 
+        iter_end = time.perf_counter()
+        token_times.append(iter_end - iter_start)
+
         # Decode and print token
         token_text = tokenizer.decode(next_token[0])
         print(token_text, end='', flush=True)
 
         # Stop if EOS token
-        if next_token.item() == tokenizer.eos_token_id:
-            break
+        if tokenizer.eos_token_id and next_token.item() == tokenizer.eos_token_id:
+          break
 
+    total_time = time.perf_counter() - start_time
     print("\n" + "-" * 80)
 
     # Decode full sequence
     generated_text = tokenizer.decode(input_ids[0], skip_special_tokens=True)
+
+    if benchmark:
+        metrics = compute_metrics(token_times, total_time, len(token_times))
+        return generated_text, metrics
+
     return generated_text
+
+
+def compute_metrics(token_times, total_time, num_tokens):
+    """
+    Compute benchmark metrics.
+
+    Metrics:
+        - TTFT (Time To First Token): Latency until first token is generated
+        - ITL (Inter-Token Latency): Average time between tokens (excluding first)
+        - Throughput: Tokens per second
+    """
+    if len(token_times) == 0:
+        return {}
+
+    ttft = token_times[0] * 1000  # Convert to ms
+
+    if len(token_times) > 1:
+      sorted_times = sorted(token_times[1:])
+      itl_mean = sum(token_times[1:]) / len(token_times[1:]) * 1000
+      itl_p50 = sorted_times[len(sorted_times) // 2] * 1000
+      itl_p99_idx = min(int(len(sorted_times) * 0.99), len(sorted_times) - 1)
+      itl_p99 = sorted_times[itl_p99_idx] * 1000
+    else:
+        itl_mean = itl_p50 = itl_p99 = 0
+
+    throughput = num_tokens / total_time if total_time > 0 else 0
+
+    metrics = {
+        "ttft_ms": ttft,
+        "itl_mean_ms": itl_mean,
+        "itl_p50_ms": itl_p50,
+        "itl_p99_ms": itl_p99,
+        "throughput_tokens_per_sec": throughput,
+        "total_time_s": total_time,
+        "num_tokens": num_tokens,
+    }
+
+    return metrics
+
+
+def print_metrics(metrics):
+    """Pretty print benchmark metrics."""
+    print("\n" + "=" * 80)
+    print("BENCHMARK METRICS")
+    print("=" * 80)
+    print(f"Time To First Token (TTFT):        {metrics['ttft_ms']:.2f} ms")
+    print(f"Inter-Token Latency (ITL) - Mean:  {metrics['itl_mean_ms']:.2f} ms")
+    print(f"Inter-Token Latency (ITL) - P50:   {metrics['itl_p50_ms']:.2f} ms")
+    print(f"Inter-Token Latency (ITL) - P99:   {metrics['itl_p99_ms']:.2f} ms")
+    print(f"Throughput:                        {metrics['throughput_tokens_per_sec']:.2f} tokens/sec")
+    print(f"Total Time:                        {metrics['total_time_s']:.2f} s")
+    print(f"Tokens Generated:                  {metrics['num_tokens']}")
+    print("=" * 80)
 
 
 def main():
     # Load model (use Mistral 7B or change to "meta-llama/Llama-3.2-8B")
-    model, tokenizer = load_model("mistralai/Mistral-7B-v0.1")
+    model, tokenizer = load_model()
 
     # Example prompt
     prompt = "The capital of France is"
 
-    # Generate
-    output = generate(
+    # Generate with benchmarking
+    output, metrics = generate(
         model=model,
         tokenizer=tokenizer,
         prompt=prompt,
-        max_new_tokens=50,
+        max_new_tokens=10,
         temperature=0.8,
-        top_k=50
+        top_k=50,
+        benchmark=True
     )
 
     print(f"\nFull output:\n{output}")
+
+    # Print benchmark results
+    print_metrics(metrics)
 
 
 if __name__ == "__main__":
