@@ -15,9 +15,10 @@ def load_model(model_name="TinyLlama/TinyLlama-1.1B-Chat-v1.0"):
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=torch.bfloat16,
-            device_map="auto"
+            torch_dtype=torch.float32,
+            low_cpu_mem_usage=True
         )
+        model = model.to("cpu")
         model.eval()
         print("Model loaded successfully")
         return model, tokenizer
@@ -170,7 +171,7 @@ def main():
         model=model,
         tokenizer=tokenizer,
         prompt=prompt,
-        max_new_tokens=10,
+        max_new_tokens=30,
         temperature=0.8,
         top_k=50,
         benchmark=True
