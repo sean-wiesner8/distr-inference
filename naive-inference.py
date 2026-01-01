@@ -170,7 +170,7 @@ def main():
         model=model,
         tokenizer=tokenizer,
         prompt=prompt,
-        max_new_tokens=10,
+        max_new_tokens=100,
         temperature=0.8,
         top_k=50,
         benchmark=True
