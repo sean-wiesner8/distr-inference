@@ -8,7 +8,7 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 
-def load_model(model_name="TinyLlama/TinyLlama-1.1B-Chat-v1.0"):
+def load_model(model_name="mistralai/Mistral-7B-v0.1"):
     """Load model and tokenizer."""
     print(f"Loading model: {model_name}")
     try:
@@ -159,7 +159,7 @@ def print_metrics(metrics):
 
 
 def main():
-    # Load model (use Mistral 7B or change to "meta-llama/Llama-3.2-8B")
+    # Load model
     model, tokenizer = load_model()
 
     # Example prompt
