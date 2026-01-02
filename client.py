@@ -9,10 +9,10 @@ import json
 def generate_text(
     prompt: str,
     max_new_tokens: int,
-    temperature: float,
-    top_k: int,
+    temperature: float = 0.8,
+    top_k: int = 50,
     server_url: str = "http://localhost:8000"
-):
+) -> dict:
     """
     Send a generate request to the inference server.
 
@@ -40,7 +40,7 @@ def generate_text(
     print("-" * 80)
 
     try:
-        response = requests.post(endpoint, json=payload)
+        response = requests.post(endpoint, json=payload, timeout=300)
         response.raise_for_status()
 
         result = response.json()

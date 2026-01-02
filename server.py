@@ -4,7 +4,7 @@ Provides HTTP endpoint for text generation using the naive inference pipeline.
 """
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from contextlib import asynccontextmanager
 import uvicorn
 
@@ -19,10 +19,10 @@ tokenizer = None
 
 class GenerateRequest(BaseModel):
     """Request model for text generation."""
-    prompt: str = Field(..., description="The input prompt for text generation")
-    max_new_tokens: int = Field(50, ge=1, le=1000, description="Maximum number of tokens to generate")
-    temperature: float = Field(1.0, gt=0.0, le=2.0, description="Sampling temperature")
-    top_k: int = Field(50, ge=0, description="Top-k sampling parameter")
+    prompt: str
+    max_new_tokens: int
+    temperature: float
+    top_k: int
 
 
 class GenerateResponse(BaseModel):
