@@ -1,6 +1,7 @@
 torch
 transformers
+accelerate
 fastapi
-pydantic==1.7.4
+pydantic
 uvicorn
 requests
