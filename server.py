@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 import uvicorn
 
 # Import from naive-inference module
-from naive_inference import load_model, generate
+from naive_inference import load_model, generate, print_metrics
 
 
 # Global variables for model and tokenizer
@@ -84,7 +84,7 @@ async def generate_text(request: GenerateRequest):
         )
 
     try:
-        generated_text = generate(
+        generated_text, metrics = generate(
             model=model,
             tokenizer=tokenizer,
             prompt=request.prompt,
@@ -92,6 +92,9 @@ async def generate_text(request: GenerateRequest):
             temperature=request.temperature,
             top_k=request.top_k
         )
+
+        # Print metrics to console
+        print_metrics(metrics)
 
         return GenerateResponse(
             generated_text=generated_text,

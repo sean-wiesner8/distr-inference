@@ -43,7 +43,7 @@ def sample_token(logits, temperature=1.0, top_k=50):
     return next_token
 
 
-def generate(model, tokenizer, prompt, max_new_tokens=50, temperature=1.0, top_k=50, benchmark=False):
+def generate(model, tokenizer, prompt, max_new_tokens=50, temperature=1.0, top_k=50, benchmark=True):
     """
     Autoregressive generation loop.
     Forward pass → sample token → append to sequence → repeat
@@ -156,31 +156,3 @@ def print_metrics(metrics):
     print(f"Total Time:                        {metrics['total_time_s']:.2f} s")
     print(f"Tokens Generated:                  {metrics['num_tokens']}")
     print("=" * 80)
-
-
-def main():
-    # Load model
-    model, tokenizer = load_model()
-
-    # Example prompt
-    prompt = "The capital of France is"
-
-    # Generate with benchmarking
-    output, metrics = generate(
-        model=model,
-        tokenizer=tokenizer,
-        prompt=prompt,
-        max_new_tokens=100,
-        temperature=0.8,
-        top_k=50,
-        benchmark=True
-    )
-
-    print(f"\nFull output:\n{output}")
-
-    # Print benchmark results
-    print_metrics(metrics)
-
-
-if __name__ == "__main__":
-    main()
