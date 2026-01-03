@@ -1,6 +1,6 @@
 """
-Bare bones single-GPU inference pipeline without KV cache.
-Implements basic autoregressive generation.
+Bare bones single-GPU inference pipeline with KV cache.
+Implements basic autoregressive generation with key-value caching.
 """
 
 import time
@@ -57,6 +57,7 @@ def generate(model, tokenizer, prompt, max_new_tokens=50, temperature=1.0, top_k
     """
     # Tokenize input
     input_ids = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
+    all_token_ids = input_ids[0].tolist()
 
     print(f"\nGenerating {max_new_tokens} tokens...")
     print(f"Prompt: {prompt}")
@@ -66,20 +67,25 @@ def generate(model, tokenizer, prompt, max_new_tokens=50, temperature=1.0, top_k
     token_times = []
     start_time = time.perf_counter()
 
+    # KV cache
+    past_key_values = None
+
     # Generation loop
     for i in range(max_new_tokens):
         iter_start = time.perf_counter()
 
-        # Forward pass through entire sequence (no KV cache)
+        # Forward pass with KV cache
         with torch.no_grad():
-            outputs = model(input_ids)
+            outputs = model(input_ids, past_key_values=past_key_values, use_cache=True)
             logits = outputs.logits
+            past_key_values = outputs.past_key_values
 
         # Sample next token
         next_token = sample_token(logits, temperature=temperature, top_k=top_k)
 
-        # Append to sequence
-        input_ids = torch.cat([input_ids, next_token], dim=-1)
+        # Update for next iteration
+        input_ids = next_token
+        all_token_ids.append(next_token.item())
 
         iter_end = time.perf_counter()
         token_times.append(iter_end - iter_start)
@@ -96,7 +102,7 @@ def generate(model, tokenizer, prompt, max_new_tokens=50, temperature=1.0, top_k
     print("\n" + "-" * 80)
 
     # Decode full sequence
-    generated_text = tokenizer.decode(input_ids[0], skip_special_tokens=True)
+    generated_text = tokenizer.decode(all_token_ids, skip_special_tokens=True)
 
     if benchmark:
         metrics = compute_metrics(token_times, total_time, len(token_times))
