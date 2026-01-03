@@ -173,3 +173,30 @@ def print_metrics(metrics):
     print(f"Peak Memory Allocated:             {metrics['peak_memory_allocated_gb']:.2f} GB")
     print(f"Peak Memory Reserved:              {metrics['peak_memory_reserved_gb']:.2f} GB")
     print("=" * 80)
+
+
+def main():
+    """Main entry point for running inference."""
+    model, tokenizer = load_model()
+
+    prompt = "The capital of France is"
+    max_new_tokens = 100
+    temperature = 0.8
+    top_k = 50
+
+    generated_text, metrics = generate(
+        model=model,
+        tokenizer=tokenizer,
+        prompt=prompt,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_k=top_k,
+        benchmark=True
+    )
+
+    print(generated_text)
+    print_metrics(metrics)
+
+
+if __name__ == "__main__":
+    main()
