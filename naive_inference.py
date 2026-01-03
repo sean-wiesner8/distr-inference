@@ -180,7 +180,7 @@ def main():
     model, tokenizer = load_model()
 
     prompt = "The capital of France is"
-    max_new_tokens = 100
+    max_new_tokens = 1000
     temperature = 0.8
     top_k = 50
 
