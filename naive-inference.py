@@ -55,6 +55,9 @@ def generate(model, tokenizer, prompt, max_new_tokens=50, temperature=1.0, top_k
         If benchmark=False: generated_text (str)
         If benchmark=True: (generated_text, metrics_dict)
     """
+    # Reset peak memory stats
+    torch.cuda.reset_peak_memory_stats()
+
     # Tokenize input
     input_ids = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
 
@@ -95,17 +98,21 @@ def generate(model, tokenizer, prompt, max_new_tokens=50, temperature=1.0, top_k
     total_time = time.perf_counter() - start_time
     print("\n" + "-" * 80)
 
+    # Collect memory stats
+    peak_memory_allocated = torch.cuda.max_memory_allocated() / (1024 ** 3)  # Convert to GB
+    peak_memory_reserved = torch.cuda.max_memory_reserved() / (1024 ** 3)  # Convert to GB
+
     # Decode full sequence
     generated_text = tokenizer.decode(input_ids[0], skip_special_tokens=True)
 
     if benchmark:
-        metrics = compute_metrics(token_times, total_time, len(token_times))
+        metrics = compute_metrics(token_times, total_time, len(token_times), peak_memory_allocated, peak_memory_reserved)
         return generated_text, metrics
 
     return generated_text
 
 
-def compute_metrics(token_times, total_time, num_tokens):
+def compute_metrics(token_times, total_time, num_tokens, peak_memory_allocated, peak_memory_reserved):
     """
     Compute benchmark metrics.
 
@@ -113,6 +120,7 @@ def compute_metrics(token_times, total_time, num_tokens):
         - TTFT (Time To First Token): Latency until first token is generated
         - ITL (Inter-Token Latency): Average time between tokens (excluding first)
         - Throughput: Tokens per second
+        - Peak Memory: Maximum GPU memory used during generation
     """
     if len(token_times) == 0:
         return {}
@@ -138,6 +146,8 @@ def compute_metrics(token_times, total_time, num_tokens):
         "throughput_tokens_per_sec": throughput,
         "total_time_s": total_time,
         "num_tokens": num_tokens,
+        "peak_memory_allocated_gb": peak_memory_allocated,
+        "peak_memory_reserved_gb": peak_memory_reserved,
     }
 
     return metrics
@@ -155,7 +165,8 @@ def print_metrics(metrics):
     print(f"Throughput:                        {metrics['throughput_tokens_per_sec']:.2f} tokens/sec")
     print(f"Total Time:                        {metrics['total_time_s']:.2f} s")
     print(f"Tokens Generated:                  {metrics['num_tokens']}")
-    print("=" * 80)
+    print(f"Peak Memory Allocated:             {metrics['peak_memory_allocated_gb']:.2f} GB")
+    print(f"Peak Memory Reserved:              {metrics['peak_memory_reserved_gb']:.2f} GB")
 
 
 def main():
