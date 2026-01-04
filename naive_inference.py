@@ -154,19 +154,24 @@ def compute_metrics(token_times, total_time, num_tokens, peak_memory_allocated, 
 
 
 def print_metrics(metrics):
-    """Pretty print benchmark metrics."""
-    print("\n" + "=" * 80)
-    print("BENCHMARK METRICS")
-    print("=" * 80)
-    print(f"Time To First Token (TTFT):        {metrics['ttft_ms']:.2f} ms")
-    print(f"Inter-Token Latency (ITL) - Mean:  {metrics['itl_mean_ms']:.2f} ms")
-    print(f"Inter-Token Latency (ITL) - P50:   {metrics['itl_p50_ms']:.2f} ms")
-    print(f"Inter-Token Latency (ITL) - P99:   {metrics['itl_p99_ms']:.2f} ms")
-    print(f"Throughput:                        {metrics['throughput_tokens_per_sec']:.2f} tokens/sec")
-    print(f"Total Time:                        {metrics['total_time_s']:.2f} s")
-    print(f"Tokens Generated:                  {metrics['num_tokens']}")
-    print(f"Peak Memory Allocated:             {metrics['peak_memory_allocated_gb']:.2f} GB")
-    print(f"Peak Memory Reserved:              {metrics['peak_memory_reserved_gb']:.2f} GB")
+    """Write benchmark metrics to a timestamped file."""
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    filename = f"metrics_{timestamp}.txt"
+    lines = [
+        "BENCHMARK METRICS",
+        "=" * 80,
+        f"Time To First Token (TTFT):        {metrics['ttft_ms']:.2f} ms",
+        f"Inter-Token Latency (ITL) - Mean:  {metrics['itl_mean_ms']:.2f} ms",
+        f"Inter-Token Latency (ITL) - P50:   {metrics['itl_p50_ms']:.2f} ms",
+        f"Inter-Token Latency (ITL) - P99:   {metrics['itl_p99_ms']:.2f} ms",
+        f"Throughput:                        {metrics['throughput_tokens_per_sec']:.2f} tokens/sec",
+        f"Total Time:                        {metrics['total_time_s']:.2f} s",
+        f"Tokens Generated:                  {metrics['num_tokens']}",
+        f"Peak Memory Allocated:             {metrics['peak_memory_allocated_gb']:.2f} GB",
+        f"Peak Memory Reserved:              {metrics['peak_memory_reserved_gb']:.2f} GB",
+    ]
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
 
 
 def main():
