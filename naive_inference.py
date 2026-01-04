@@ -161,7 +161,7 @@ def compute_metrics(token_times, total_time, num_tokens, peak_memory_allocated, 
 def print_metrics(metrics):
     """Write benchmark metrics to a timestamped file."""
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    filename = f"metrics_{timestamp}.txt"
+    filename = f"metrics/metrics_{timestamp}.txt"
     lines = [
         "BENCHMARK METRICS",
         "=" * 80,
