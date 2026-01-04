@@ -1,0 +1,11 @@
+BENCHMARK METRICS
+================================================================================
+Time To First Token (TTFT):        959.66 ms
+Inter-Token Latency (ITL) - Mean:  27.77 ms
+Inter-Token Latency (ITL) - P50:   27.53 ms
+Inter-Token Latency (ITL) - P99:   30.63 ms
+Throughput:                        17.15 tokens/sec
+Total Time:                        58.32 s
+Tokens Generated:                  1000
+Peak Memory Allocated:             13.92 GB
+Peak Memory Reserved:              16.13 GB
