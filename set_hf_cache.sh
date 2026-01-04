@@ -1,3 +1,3 @@
 #!/bin/bash
-# Set HuggingFace cache to use /workspace (20GB available)
-export HF_HOME=/workspace/hf_cache
+# Set HuggingFace cache to use /dev/shm (20GB available)
+export HF_HOME=/dev/shm/hf_cache
