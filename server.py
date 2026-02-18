@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 import uvicorn
 
 # Import from naive-inference module
-from naive_inference import load_model, generate, print_metrics
+from main import load_model, generate, print_metrics
 
 
 # Global variables for model and tokenizer
