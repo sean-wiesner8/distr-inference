@@ -1,6 +1,6 @@
 """
 FastAPI server for distributed inference.
-Provides HTTP endpoint for text generation using the naive inference pipeline.
+Provides HTTP endpoint for text generation using the inference engine.
 """
 
 from fastapi import FastAPI, HTTPException
@@ -8,13 +8,11 @@ from pydantic import BaseModel
 from contextlib import asynccontextmanager
 import uvicorn
 
-# Import from naive-inference module
-from main import load_model, generate, print_metrics
+from distr_inference import InferenceEngine, print_metrics
 
 
-# Global variables for model and tokenizer
-model = None
-tokenizer = None
+# Global inference engine
+engine: InferenceEngine | None = None
 
 
 class GenerateRequest(BaseModel):
@@ -37,28 +35,27 @@ class GenerateResponse(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager - loads model on startup."""
-    global model, tokenizer
+    global engine
 
     print("Starting up FastAPI server...")
-    print("Loading model and tokenizer...")
+    print("Loading model...")
 
     try:
-        model, tokenizer = load_model()
-        print("Model and tokenizer loaded successfully!")
+        engine = InferenceEngine()
+        print("Model loaded successfully!")
     except Exception as e:
         print(f"Failed to load model: {e}")
         raise
 
     yield
 
-    # Cleanup on shutdown
     print("Shutting down server...")
 
 
 # Create FastAPI app with lifespan
 app = FastAPI(
     title="Distributed Inference API",
-    description="API for text generation using naive inference pipeline",
+    description="API for text generation using the inference engine",
     version="1.0.0",
     lifespan=lifespan
 )
@@ -75,25 +72,20 @@ async def generate_text(request: GenerateRequest):
     Returns:
         GenerateResponse with generated text and request parameters
     """
-    global model, tokenizer
-
-    if model is None or tokenizer is None:
+    if engine is None:
         raise HTTPException(
             status_code=503,
             detail="Model not loaded. Server may still be initializing."
         )
 
     try:
-        generated_text, metrics = generate(
-            model=model,
-            tokenizer=tokenizer,
+        generated_text, metrics = engine.generate(
             prompt=request.prompt,
             max_new_tokens=request.max_new_tokens,
             temperature=request.temperature,
             top_k=request.top_k
         )
 
-        # Print metrics to console
         print_metrics(metrics)
 
         return GenerateResponse(
@@ -116,7 +108,7 @@ async def health_check():
     """Health check endpoint."""
     return {
         "status": "healthy",
-        "model_loaded": model is not None and tokenizer is not None
+        "model_loaded": engine is not None
     }
 
 

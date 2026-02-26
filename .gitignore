@@ -64,10 +64,11 @@ coverage.xml
 models/
 checkpoints/
 
-# Logs
+# Logs and output files
 *.log
 logs/
 wandb/
+metrics_*.txt
 
 # Environment variables
 .env

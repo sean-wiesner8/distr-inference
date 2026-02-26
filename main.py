@@ -1,5 +1,4 @@
-from inference_engine import InferenceEngine
-from metrics import print_metrics
+from distr_inference import InferenceEngine, print_metrics
 
 
 def main():

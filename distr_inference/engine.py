@@ -6,7 +6,7 @@ Implements basic autoregressive generation with key-value caching.
 import time
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from metrics import compute_metrics
+from .metrics import compute_metrics
 
 
 class InferenceEngine:
@@ -121,4 +121,3 @@ class InferenceEngine:
         next_token = torch.multinomial(probs, num_samples=1)
 
         return next_token
-
