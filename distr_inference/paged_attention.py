@@ -58,8 +58,7 @@ class PagedAttention(nn.Module):
     num_kv_heads: Number of key/value heads (< num_heads for GQA/MQA).
     head_dim    : Per-head feature dimension.
     q_proj      : Query projection (nn.Linear, weights copied from the HF layer).
-    k_proj      : Key projection.
-    v_proj      : Value projection.
+    kv_proj     : Fused key/value projection with output dim 2 * num_kv_heads * head_dim.
     o_proj      : Output projection.
     rotary_emb  : Optional rotary embedding module from the original HF layer.
     """
@@ -79,8 +78,7 @@ class PagedAttention(nn.Module):
         num_kv_heads: int,
         head_dim: int,
         q_proj: nn.Linear,
-        k_proj: nn.Linear,
-        v_proj: nn.Linear,
+        kv_proj: nn.Linear,
         o_proj: nn.Linear,
         rotary_emb: Optional[nn.Module] = None,
     ) -> None:
@@ -91,8 +89,7 @@ class PagedAttention(nn.Module):
         self.head_dim = head_dim
 
         self.q_proj = q_proj
-        self.k_proj = k_proj
-        self.v_proj = v_proj
+        self.kv_proj = kv_proj
         self.o_proj = o_proj
         self.rotary_emb = rotary_emb
 
@@ -117,14 +114,29 @@ class PagedAttention(nn.Module):
         num_kv_heads = getattr(model_config, "num_key_value_heads", num_heads)
         head_dim     = model_config.hidden_size // num_heads
 
+        # Fuse separate K and V projections into a single linear layer.
+        k_proj = attn_layer.k_proj
+        v_proj = attn_layer.v_proj
+        has_bias = k_proj.bias is not None
+
+        kv_proj = nn.Linear(
+            k_proj.in_features,
+            2 * num_kv_heads * head_dim,
+            bias=has_bias,
+            device=k_proj.weight.device,
+            dtype=k_proj.weight.dtype,
+        )
+        kv_proj.weight.data.copy_(torch.cat([k_proj.weight, v_proj.weight], dim=0))
+        if has_bias:
+            kv_proj.bias.data.copy_(torch.cat([k_proj.bias, v_proj.bias], dim=0))
+
         return cls(
             layer_idx=layer_idx,
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             q_proj=attn_layer.q_proj,
-            k_proj=attn_layer.k_proj,
-            v_proj=attn_layer.v_proj,
+            kv_proj=kv_proj,
             o_proj=attn_layer.o_proj,
             rotary_emb=getattr(attn_layer, "rotary_emb", None),
         )
@@ -164,15 +176,19 @@ class PagedAttention(nn.Module):
     def _project(
         self,
         hidden_states: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Apply Q/K/V projections and reshape to [batch, heads, seq_len, head_dim].
+        Apply Q and fused KV projections.
+
+        Returns
+        -------
+        q  : [batch, seq_len, num_heads, head_dim]
+        kv : [batch, seq_len, 2, num_kv_heads, head_dim]
         """
         bsz, seq_len, _ = hidden_states.shape
-        q = self.q_proj(hidden_states).view(bsz, seq_len, self.num_heads,    self.head_dim).transpose(1, 2)
-        k = self.k_proj(hidden_states).view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(hidden_states).view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        return q, k, v
+        q  = self.q_proj(hidden_states).view(bsz, seq_len, self.num_heads, self.head_dim)
+        kv = self.kv_proj(hidden_states).view(bsz, seq_len, 2, self.num_kv_heads, self.head_dim)
+        return q, kv
 
     def _apply_rotary(
         self,
@@ -245,7 +261,8 @@ class PagedAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_ids: Optional[torch.Tensor],
     ) -> Optional[torch.Tensor]:
-        q, k, v = self._project(hidden_states)
+        q, kv   = self._project(hidden_states)
+        k, v    = kv.unbind(dim=2)
         q, k    = self._apply_rotary(q, k, position_ids)
 
         for i, seq_id in enumerate(self._block_table):
@@ -258,7 +275,8 @@ class PagedAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_ids: Optional[torch.Tensor],
     ) -> Optional[torch.Tensor]:
-        q, k, v = self._project(hidden_states)
+        q, kv   = self._project(hidden_states)
+        k, v    = kv.unbind(dim=2)
         q, k    = self._apply_rotary(q, k, position_ids)
 
         attn_outs = []
