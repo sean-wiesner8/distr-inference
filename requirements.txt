@@ -1,4 +1,5 @@
 torch
+flash-attn
 transformers
 accelerate
 fastapi

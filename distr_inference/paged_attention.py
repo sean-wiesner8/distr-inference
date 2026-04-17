@@ -31,6 +31,7 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+from flash_attn import flash_attn_varlen_func
 
 from .block_manager import BlockManager
 
@@ -394,16 +395,12 @@ class PagedAttention(nn.Module):
                 if block._num_filled <= slot_idx:
                     block._num_filled = slot_idx + 1
 
-    # ------------------------------------------------------------------
-    # Placeholder kernels (not yet implemented)
-    # ------------------------------------------------------------------
-
     def _prefill_attention(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        cu_seqlens: List[int],
+        cu_seqlens: torch.Tensor,
         max_seqlen: int,
     ) -> torch.Tensor:
         """
@@ -414,16 +411,23 @@ class PagedAttention(nn.Module):
         q           : [total_tokens, num_heads, head_dim]
         k           : [total_tokens, num_kv_heads, head_dim]
         v           : [total_tokens, num_kv_heads, head_dim]
-        cu_seqlens  : Cumulative sequence lengths (length num_seqs + 1).
+        cu_seqlens  : int32 tensor of cumulative sequence lengths (len num_seqs+1).
         max_seqlen  : Maximum sequence length in the batch.
 
         Returns
         -------
         out : [total_tokens, num_heads, head_dim]
-
-        Not yet implemented — returns zeros with the correct shape.
         """
-        return torch.zeros_like(q)
+        return flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            causal=True,
+        )
 
     def _decode_attention(
         self,
