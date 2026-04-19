@@ -1,14 +1,20 @@
 """
 Block manager for paged KV cache.
 
-Manages a fixed pool of pre-allocated KVBlocks and maps logical block indices
-to physical block IDs on a per-sequence basis.
+Manages a fixed pool of pre-allocated blocks backed by contiguous K/V buffers
+and maps logical block indices to physical block IDs on a per-sequence basis.
+
+The KV cache is stored as two contiguous tensors (one for K, one for V) with
+shape [num_layers, num_blocks, block_size, num_kv_heads, head_dim].  This
+layout lets flash-attention index directly into the cache using a block table
+without gathering into temporary buffers.
 
 Concepts
 --------
-Physical block : A KVBlock instance with a unique integer ID. All physical
-                 blocks are allocated once at startup and live in the free pool
-                 until assigned to a sequence.
+Physical block : A slice along the ``num_blocks`` dimension of the cache
+                 tensors, identified by an integer ID.  All physical blocks
+                 are pre-allocated at startup and live in the free pool until
+                 assigned to a sequence.
 
 Logical block  : A sequence-local index (0, 1, 2, ...) that grows as a
                  sequence produces more tokens. The block table translates
@@ -20,31 +26,43 @@ Block table    : Per-sequence dict[int, int]  (logical_idx → physical_block_id
 from __future__ import annotations
 
 from collections import deque
-from typing import Dict
+from typing import Dict, Tuple
 
-from .kv_cache import KVBlock, KVBlockConfig
+import torch
+
+from .kv_cache import KVBlockConfig, BlockState
 
 
 class BlockManager:
     """
-    Manages a fixed pool of KVBlocks and per-sequence block tables.
+    Manages a contiguous KV cache pool and per-sequence block tables.
 
     Parameters
     ----------
     num_blocks : int
         Total number of physical blocks to pre-allocate.
     config : KVBlockConfig
-        Shape / dtype / device configuration forwarded to every KVBlock.
+        Shape / dtype / device configuration for the cache buffers.
     """
 
     def __init__(self, num_blocks: int, config: KVBlockConfig) -> None:
         self.config = config
         self.num_blocks = num_blocks
 
-        # Pre-allocate all physical blocks
-        self._blocks: Dict[int, KVBlock] = {
-            i: KVBlock(block_id=i, config=config) for i in range(num_blocks)
-        }
+        # Contiguous KV cache buffers
+        shape = (
+            config.num_layers,
+            num_blocks,
+            config.block_size,
+            config.num_kv_heads,
+            config.head_dim,
+        )
+        self.k_cache = torch.zeros(shape, dtype=config.dtype, device=config.device)
+        self.v_cache = torch.zeros(shape, dtype=config.dtype, device=config.device)
+
+        # Per-block metadata
+        self._block_states: list[BlockState] = [BlockState.FREE] * num_blocks
+        self._num_filled: list[int] = [0] * num_blocks
 
         # Free pool — deque for O(1) pop/append
         self._free_pool: deque[int] = deque(range(num_blocks))
@@ -96,8 +114,8 @@ class BlockManager:
             raise KeyError(f"Sequence {seq_id} is not registered.")
 
         for physical_id in self._block_tables[seq_id].values():
-            block = self._blocks[physical_id]
-            block.reset()
+            self._block_states[physical_id] = BlockState.FREE
+            self._num_filled[physical_id] = 0
             self._free_pool.append(physical_id)
 
         del self._block_tables[seq_id]
@@ -129,33 +147,15 @@ class BlockManager:
             raise RuntimeError("Out of physical KV cache blocks.")
 
         physical_id = self._free_pool.popleft()
-        block = self._blocks[physical_id]
-        block.state  # block.reset() was called on free, so state is FREE
+        self._block_states[physical_id] = BlockState.ALLOCATED
 
         logical_idx = len(self._block_tables[seq_id])
         self._block_tables[seq_id][logical_idx] = physical_id
         return logical_idx
 
     # ------------------------------------------------------------------
-    # Block access
+    # Block table access
     # ------------------------------------------------------------------
-
-    def get_block(self, seq_id: int, logical_idx: int) -> KVBlock:
-        """
-        Retrieve the physical KVBlock for a given (sequence, logical index) pair.
-
-        Raises
-        ------
-        KeyError if seq_id or logical_idx is not found.
-        """
-        if seq_id not in self._block_tables:
-            raise KeyError(f"Sequence {seq_id} is not registered.")
-        table = self._block_tables[seq_id]
-        if logical_idx not in table:
-            raise KeyError(
-                f"Logical block {logical_idx} not allocated for sequence {seq_id}."
-            )
-        return self._blocks[table[logical_idx]]
 
     def get_block_table(self, seq_id: int) -> Dict[int, int]:
         """
@@ -174,6 +174,50 @@ class BlockManager:
         if seq_id not in self._block_tables:
             raise KeyError(f"Sequence {seq_id} is not registered.")
         return len(self._block_tables[seq_id])
+
+    # ------------------------------------------------------------------
+    # Cache read / write
+    # ------------------------------------------------------------------
+
+    def get_kv_cache(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Return views of the K and V cache for a single layer.
+
+        Returns
+        -------
+        (k, v) each of shape [num_blocks, block_size, num_kv_heads, head_dim]
+        """
+        return self.k_cache[layer_idx], self.v_cache[layer_idx]
+
+    def write_slot(
+        self,
+        physical_block_id: int,
+        slot_idx: int,
+        layer_idx: int,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> None:
+        """
+        Write K/V for a single (block, slot, layer) triple.
+
+        Parameters
+        ----------
+        physical_block_id : Index into the cache's block dimension.
+        slot_idx          : Position within the block [0, block_size).
+        layer_idx         : Attention layer index.
+        k                 : [num_kv_heads, head_dim]
+        v                 : [num_kv_heads, head_dim]
+        """
+        self.k_cache[layer_idx, physical_block_id, slot_idx] = k
+        self.v_cache[layer_idx, physical_block_id, slot_idx] = v
+
+    def get_num_filled(self, physical_block_id: int) -> int:
+        """Return how many slots have been written in a block."""
+        return self._num_filled[physical_block_id]
+
+    def set_num_filled(self, physical_block_id: int, count: int) -> None:
+        """Update the filled-slot count for a block."""
+        self._num_filled[physical_block_id] = count
 
     # ------------------------------------------------------------------
     # Dunder helpers

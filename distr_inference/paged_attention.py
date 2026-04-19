@@ -227,16 +227,17 @@ class PagedAttention(nn.Module):
                 if slot_idx == 0 and bm.num_blocks_for_sequence(sid) <= logical_idx:
                     bm.allocate_block(sid)
 
-                block = bm.get_block(sid, logical_idx)
-                block.write_slot(
+                physical_id = bm.get_block_table(sid)[logical_idx]
+                bm.write_slot(
+                    physical_block_id=physical_id,
                     slot_idx=slot_idx,
                     layer_idx=self.layer_idx,
                     k=k[start + t],
                     v=v[start + t],
                 )
-                # Update filled count so get_filled_kv reflects written slots.
-                if block._num_filled <= slot_idx:
-                    block._num_filled = slot_idx + 1
+                # Update filled count so reads reflect written slots.
+                if bm.get_num_filled(physical_id) <= slot_idx:
+                    bm.set_num_filled(physical_id, slot_idx + 1)
 
     # ------------------------------------------------------------------
     # Attention

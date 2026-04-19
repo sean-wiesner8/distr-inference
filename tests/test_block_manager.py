@@ -31,6 +31,13 @@ def test_all_blocks_free_on_init():
     assert manager.num_used_blocks == 0
 
 
+def test_contiguous_cache_shape():
+    manager = make_manager(num_blocks=8)
+    expected = (CONFIG.num_layers, 8, CONFIG.block_size, CONFIG.num_kv_heads, CONFIG.head_dim)
+    assert manager.k_cache.shape == expected
+    assert manager.v_cache.shape == expected
+
+
 # ---------------------------------------------------------------------------
 # register_sequence / free_sequence
 # ---------------------------------------------------------------------------
@@ -101,17 +108,8 @@ def test_allocate_block_raises_when_pool_exhausted():
 
 
 # ---------------------------------------------------------------------------
-# get_block / get_block_table
+# get_block_table
 # ---------------------------------------------------------------------------
-
-def test_get_block_returns_kvblock():
-    from distr_inference.kv_cache import KVBlock
-    manager = make_manager()
-    manager.register_sequence(seq_id=0)
-    manager.allocate_block(seq_id=0)
-    block = manager.get_block(seq_id=0, logical_idx=0)
-    assert isinstance(block, KVBlock)
-
 
 def test_get_block_table_reflects_allocations():
     manager = make_manager()
@@ -141,3 +139,49 @@ def test_can_allocate():
     assert manager.can_allocate(1) is True
     assert manager.can_allocate(2) is True
     assert manager.can_allocate(3) is False
+
+
+# ---------------------------------------------------------------------------
+# write_slot / get_kv_cache
+# ---------------------------------------------------------------------------
+
+def test_write_slot_and_read_back():
+    manager = make_manager(num_blocks=4)
+    manager.register_sequence(seq_id=0)
+    manager.allocate_block(seq_id=0)
+
+    physical_id = manager.get_block_table(seq_id=0)[0]
+
+    k = torch.randn(CONFIG.num_kv_heads, CONFIG.head_dim)
+    v = torch.randn(CONFIG.num_kv_heads, CONFIG.head_dim)
+
+    manager.write_slot(physical_id, slot_idx=0, layer_idx=0, k=k, v=v)
+
+    k_layer, v_layer = manager.get_kv_cache(layer_idx=0)
+    assert k_layer.shape == (4, CONFIG.block_size, CONFIG.num_kv_heads, CONFIG.head_dim)
+    assert torch.allclose(k_layer[physical_id, 0], k)
+    assert torch.allclose(v_layer[physical_id, 0], v)
+
+
+def test_num_filled_tracking():
+    manager = make_manager(num_blocks=4)
+    manager.register_sequence(seq_id=0)
+    manager.allocate_block(seq_id=0)
+
+    physical_id = manager.get_block_table(seq_id=0)[0]
+    assert manager.get_num_filled(physical_id) == 0
+
+    manager.set_num_filled(physical_id, 3)
+    assert manager.get_num_filled(physical_id) == 3
+
+
+def test_free_sequence_resets_num_filled():
+    manager = make_manager(num_blocks=4)
+    manager.register_sequence(seq_id=0)
+    manager.allocate_block(seq_id=0)
+
+    physical_id = manager.get_block_table(seq_id=0)[0]
+    manager.set_num_filled(physical_id, 2)
+
+    manager.free_sequence(seq_id=0)
+    assert manager.get_num_filled(physical_id) == 0
