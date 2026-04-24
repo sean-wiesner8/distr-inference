@@ -35,6 +35,7 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+from flash_attn import flash_attn_varlen_func
 
 from .block_manager import BlockManager
 
@@ -246,37 +247,46 @@ class PagedAttention(nn.Module):
     def _attention(
         self,
         q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
         cu_seqlens_q: torch.Tensor,
         cu_seqlens_k: torch.Tensor,
         max_seqlen_q: int,
         max_seqlen_k: int,
         block_table: torch.Tensor,
-        seq_lens: List[int],
     ) -> torch.Tensor:
         """
         Combined attention for mixed prefill/decode batches.
 
+        Uses flash_attn_varlen_func with a block table to read K/V directly
+        from the contiguous paged cache.
+
         Parameters
         ----------
         q            : [total_tokens, num_heads, head_dim]
-        k            : [total_tokens, num_kv_heads, head_dim]
-        v            : [total_tokens, num_kv_heads, head_dim]
+        k_cache      : [num_blocks, block_size, num_kv_heads, head_dim]
+        v_cache      : [num_blocks, block_size, num_kv_heads, head_dim]
         cu_seqlens_q : int32 tensor of cumulative query token counts (len num_seqs+1).
         cu_seqlens_k : int32 tensor of cumulative key token counts (len num_seqs+1).
         max_seqlen_q : Maximum query sequence length in the batch.
         max_seqlen_k : Maximum key sequence length in the batch.
         block_table  : [num_seqs, max_blocks_per_seq] physical block IDs.
-        seq_lens     : Total KV length per sequence (including new tokens).
 
         Returns
         -------
         out : [total_tokens, num_heads, head_dim]
-
-        Not yet implemented — returns zeros with the correct shape.
         """
-        return torch.zeros_like(q)
+        return flash_attn_varlen_func(
+            q,
+            k_cache,
+            v_cache,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            causal=True,
+            block_table=block_table,
+        )
 
     # ------------------------------------------------------------------
     # Forward
@@ -341,14 +351,16 @@ class PagedAttention(nn.Module):
             out=cu_seqlens_k[1:],
         )
 
+        # K/V are read directly from the contiguous paged cache by the kernel.
+        k_cache, v_cache = block_manager.get_kv_cache(self.layer_idx)
+
         attn_out = self._attention(
-            q, k, v,
+            q, k_cache, v_cache,
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             block_table=block_table,
-            seq_lens=total_seq_lens,
         )
 
         # --- 5. Output projection ---
