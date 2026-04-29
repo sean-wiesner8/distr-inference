@@ -35,7 +35,6 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from flash_attn import flash_attn_varlen_func
 
 from .block_manager import BlockManager
 
@@ -276,6 +275,7 @@ class PagedAttention(nn.Module):
         -------
         out : [total_tokens, num_heads, head_dim]
         """
+        from flash_attn import flash_attn_varlen_func
         return flash_attn_varlen_func(
             q,
             k_cache,

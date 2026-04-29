@@ -1,16 +1,8 @@
 """Tests for PagedAttention in paged_attention.py."""
 
-import sys
-from unittest.mock import MagicMock
-
 import pytest
 import torch
 import torch.nn as nn
-
-# Inject a mock for flash_attn so we can import PagedAttention on CPU.
-_flash_attn_mock = MagicMock()
-if "flash_attn" not in sys.modules:
-    sys.modules["flash_attn"] = _flash_attn_mock
 
 from distr_inference.paged_attention import PagedAttention, _rotate_half
 from distr_inference.block_manager import BlockManager
@@ -360,14 +352,13 @@ def _mock_flash_attn(q, k, v, **kwargs):
 
 
 def _run_forward_mocked(attn, hidden_states, position_ids, cu_seqlens, bm, seq_ids, seq_lens):
-    """Run forward with flash_attn_varlen_func mocked out."""
-    import distr_inference.paged_attention as pa_mod
-    original = pa_mod.flash_attn_varlen_func
-    pa_mod.flash_attn_varlen_func = _mock_flash_attn
+    """Run forward with _attention monkey-patched to avoid flash-attn."""
+    original = attn._attention
+    attn._attention = lambda q, k_cache, v_cache, **kw: torch.zeros_like(q)
     try:
         return attn(hidden_states, position_ids, cu_seqlens, bm, seq_ids, seq_lens)
     finally:
-        pa_mod.flash_attn_varlen_func = original
+        attn._attention = original
 
 
 def test_forward_output_shape_prefill():
@@ -455,9 +446,9 @@ def test_forward_mixed_batch():
 
 _has_cuda = torch.cuda.is_available()
 try:
-    import flash_attn as _real_flash_attn
-    _has_flash_attn = hasattr(_real_flash_attn, "flash_attn_varlen_func")
-except Exception:
+    from flash_attn import flash_attn_varlen_func as _real_fn  # noqa: F401
+    _has_flash_attn = True
+except ImportError:
     _has_flash_attn = False
 
 requires_gpu = pytest.mark.skipif(
