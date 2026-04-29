@@ -461,7 +461,7 @@ requires_gpu = pytest.mark.skipif(
 def test_attention_output_shape_gpu():
     cfg = KVBlockConfig(
         num_layers=NUM_LAYERS, num_kv_heads=NUM_KV_HEADS, head_dim=HEAD_DIM,
-        block_size=BLOCK_SIZE, dtype=torch.bfloat16, device="cuda",
+        block_size=256, dtype=torch.bfloat16, device="cuda",
     )
     bm = BlockManager(num_blocks=16, config=cfg)
     attn = PagedAttention(
@@ -488,7 +488,7 @@ def test_attention_output_shape_gpu():
 def test_forward_end_to_end_gpu():
     cfg = KVBlockConfig(
         num_layers=NUM_LAYERS, num_kv_heads=NUM_KV_HEADS, head_dim=HEAD_DIM,
-        block_size=BLOCK_SIZE, dtype=torch.bfloat16, device="cuda",
+        block_size=256, dtype=torch.bfloat16, device="cuda",
     )
     bm = BlockManager(num_blocks=16, config=cfg)
     attn = PagedAttention(
