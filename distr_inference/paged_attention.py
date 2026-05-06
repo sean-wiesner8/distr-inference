@@ -1,31 +1,36 @@
 """
-Paged attention module for dropping into HuggingFace transformer models.
+Paged attention module for transformer inference with packed token buffers.
 
-Replace any HF attention layer with PagedAttention to get a paged KV cache
-backed by BlockManager / KVBlock.  Inference state (block manager, sequence
-IDs, sequence lengths, phase flag) is set globally on the class before each
-forward pass via set_state(), so individual forward calls keep the standard
-HF attention signature.
+Supports mixed prefill/decode batches using packed 1-D tensors where tokens
+from multiple sequences (both prompt and generation) are concatenated into
+a single contiguous buffer.
 
 Typical usage
 -------------
-    model = LlamaForCausalLM.from_pretrained(...)
-    block_manager = BlockManager(num_blocks=512, config=kv_cfg)
-
-    for i, layer in enumerate(model.model.layers):
-        layer.self_attn = PagedAttention.from_hf_attention(
-            layer.self_attn, model.config, i
-        )
-
-    # Before each forward pass:
-    PagedAttention.set_state(
-        model, block_manager, seq_ids, seq_lens, is_prefill=True
+    attn = PagedAttention(
+        layer_idx=0,
+        num_heads=32,
+        num_kv_heads=8,
+        head_dim=128,
+        q_proj=q_linear,
+        kv_proj=kv_linear,
+        o_proj=o_linear,
+        rotary_emb=rope_module,
     )
-    outputs = model(input_ids)
+
+    out = attn(
+        hidden_states,   # [total_tokens, hidden]
+        position_ids,    # [total_tokens]
+        cu_seqlens,      # [num_seqs + 1]
+        block_manager,
+        seq_ids,
+        seq_lens,
+    )
 """
 
 from __future__ import annotations
 
+import math
 from typing import List, Optional, Tuple
 
 import torch
@@ -49,7 +54,8 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 class PagedAttention(nn.Module):
     """
-    Drop-in replacement for HF self-attention layers with a paged KV cache.
+    Attention layer with a paged KV cache, operating on packed 1-D token
+    buffers to support mixed prefill/decode batches.
 
     Parameters
     ----------
@@ -57,20 +63,11 @@ class PagedAttention(nn.Module):
     num_heads   : Number of query attention heads.
     num_kv_heads: Number of key/value heads (< num_heads for GQA/MQA).
     head_dim    : Per-head feature dimension.
-    q_proj      : Query projection (nn.Linear, weights copied from the HF layer).
-    k_proj      : Key projection.
-    v_proj      : Value projection.
+    q_proj      : Query projection (nn.Linear).
+    kv_proj     : Fused key/value projection with output dim 2 * num_kv_heads * head_dim.
     o_proj      : Output projection.
-    rotary_emb  : Optional rotary embedding module from the original HF layer.
+    rotary_emb  : Optional rotary embedding module.
     """
-
-    # ------------------------------------------------------------------
-    # Class-level inference state — set once per forward pass via set_state()
-    # ------------------------------------------------------------------
-    _block_manager: Optional[BlockManager] = None
-    _block_table: Optional[List[int]] = None   # seq_id per batch element
-    _seq_lens: Optional[List[int]] = None      # current KV length per batch element
-    _is_prefill: bool = False
 
     def __init__(
         self,
@@ -79,8 +76,7 @@ class PagedAttention(nn.Module):
         num_kv_heads: int,
         head_dim: int,
         q_proj: nn.Linear,
-        k_proj: nn.Linear,
-        v_proj: nn.Linear,
+        kv_proj: nn.Linear,
         o_proj: nn.Linear,
         rotary_emb: Optional[nn.Module] = None,
     ) -> None:
@@ -91,71 +87,40 @@ class PagedAttention(nn.Module):
         self.head_dim = head_dim
 
         self.q_proj = q_proj
-        self.k_proj = k_proj
-        self.v_proj = v_proj
+        self.kv_proj = kv_proj
         self.o_proj = o_proj
         self.rotary_emb = rotary_emb
 
     # ------------------------------------------------------------------
-    # Construction
+    # Block-table helpers
     # ------------------------------------------------------------------
 
-    @classmethod
-    def from_hf_attention(
-        cls,
-        attn_layer: nn.Module,
-        model_config,
-        layer_idx: int,
-    ) -> "PagedAttention":
-        """
-        Build a PagedAttention from an existing HF attention layer, copying weights.
-
-        Supports Llama-style layers that expose q_proj / k_proj / v_proj / o_proj
-        as nn.Linear and optionally a rotary_emb module.
-        """
-        num_heads    = model_config.num_attention_heads
-        num_kv_heads = getattr(model_config, "num_key_value_heads", num_heads)
-        head_dim     = model_config.hidden_size // num_heads
-
-        return cls(
-            layer_idx=layer_idx,
-            num_heads=num_heads,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            q_proj=attn_layer.q_proj,
-            k_proj=attn_layer.k_proj,
-            v_proj=attn_layer.v_proj,
-            o_proj=attn_layer.o_proj,
-            rotary_emb=getattr(attn_layer, "rotary_emb", None),
-        )
-
-    # ------------------------------------------------------------------
-    # Global inference state
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def set_state(
-        model: nn.Module,
+    def _build_block_table_tensor(
+        self,
         block_manager: BlockManager,
-        block_table: List[int],
+        seq_ids: List[int],
         seq_lens: List[int],
-        is_prefill: bool,
-    ) -> None:
+        device: torch.device,
+    ) -> torch.Tensor:
         """
-        Set inference state on all PagedAttention layers before a forward pass.
+        Build a [num_seqs, max_blocks_per_seq] int32 tensor of physical block
+        IDs from the block manager's per-sequence block tables.
 
-        Parameters
-        ----------
-        model         : HF model that contains PagedAttention layers.
-        block_manager : Shared physical KV cache block pool.
-        block_table   : Sequence ID for each element in the current batch.
-        seq_lens      : Current KV sequence length for each batch element.
-        is_prefill    : True for the prompt phase; False for single-token decode.
+        Sequences with fewer blocks than the maximum are right-padded with -1.
         """
-        PagedAttention._block_manager = block_manager
-        PagedAttention._block_table   = block_table
-        PagedAttention._seq_lens      = seq_lens
-        PagedAttention._is_prefill    = is_prefill
+        block_size = block_manager.config.block_size
+        max_blocks = max(
+            math.ceil(slen / block_size) for slen in seq_lens
+        ) if seq_lens else 0
+
+        table = torch.full(
+            (len(seq_ids), max_blocks), -1, dtype=torch.int32, device=device,
+        )
+        for i, sid in enumerate(seq_ids):
+            bt = block_manager.get_block_table(sid)
+            for logical_idx, physical_id in bt.items():
+                table[i, logical_idx] = physical_id
+        return table
 
     # ------------------------------------------------------------------
     # Shared sub-operations
@@ -164,139 +129,241 @@ class PagedAttention(nn.Module):
     def _project(
         self,
         hidden_states: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Apply Q/K/V projections and reshape to [batch, heads, seq_len, head_dim].
+        Apply Q and fused KV projections on a 1-D token buffer.
+
+        Parameters
+        ----------
+        hidden_states : [total_tokens, hidden]
+
+        Returns
+        -------
+        q  : [total_tokens, num_heads, head_dim]
+        kv : [total_tokens, 2, num_kv_heads, head_dim]
         """
-        bsz, seq_len, _ = hidden_states.shape
-        q = self.q_proj(hidden_states).view(bsz, seq_len, self.num_heads,    self.head_dim).transpose(1, 2)
-        k = self.k_proj(hidden_states).view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(hidden_states).view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        return q, k, v
+        total_tokens = hidden_states.shape[0]
+        q  = self.q_proj(hidden_states).view(total_tokens, self.num_heads, self.head_dim)
+        kv = self.kv_proj(hidden_states).view(total_tokens, 2, self.num_kv_heads, self.head_dim)
+        return q, kv
 
     def _apply_rotary(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
-        position_ids: Optional[torch.Tensor],
+        position_ids: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Apply rotary positional embeddings to Q and K.
+        Apply rotary positional embeddings to Q and K on a 1-D token buffer.
 
-        Expects rotary_emb to follow the HF convention:
-            cos, sin = rotary_emb(q, position_ids)
-        where cos/sin have shape [batch, 1, seq_len, head_dim].
+        Parameters
+        ----------
+        q            : [total_tokens, num_heads, head_dim]
+        k            : [total_tokens, num_kv_heads, head_dim]
+        position_ids : [1, total_tokens]
 
-        No-op if rotary_emb is absent or position_ids is None.
+        No-op if rotary_emb is absent.
         """
-        if self.rotary_emb is None or position_ids is None:
+        if self.rotary_emb is None:
             return q, k
 
-        cos, sin = self.rotary_emb(q, position_ids)
-        q = q * cos + _rotate_half(q) * sin
-        k = k * cos + _rotate_half(k) * sin
-        return q, k
+        # rotary_emb expects [batch, seq, heads, dim] — wrap the flat buffer
+        # in a batch-of-1 so cos/sin shapes are broadcast-compatible.
+        q_4d = q.unsqueeze(0)   # [1, total_tokens, num_heads, head_dim]
+        k_4d = k.unsqueeze(0)   # [1, total_tokens, num_kv_heads, head_dim]
+
+        cos, sin = self.rotary_emb(q_4d, position_ids)
+        q_4d = q_4d * cos + _rotate_half(q_4d) * sin
+        k_4d = k_4d * cos + _rotate_half(k_4d) * sin
+
+        return q_4d.squeeze(0), k_4d.squeeze(0)
 
     # ------------------------------------------------------------------
-    # Placeholder kernels (not yet implemented)
+    # KV cache write helpers
     # ------------------------------------------------------------------
 
-    def _prefill_flash_attention(
+    def _write_kv_to_paged_cache(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        block_manager: BlockManager,
+        seq_ids: List[int],
+        seq_lens_before: List[int],
+    ) -> None:
+        """
+        Scatter K/V tokens from the 1-D buffer into the paged KV cache.
+
+        Each sequence contributes ``cu_seqlens[i+1] - cu_seqlens[i]`` new
+        tokens (multiple for prefill, one for decode).
+
+        Parameters
+        ----------
+        k              : [total_tokens, num_kv_heads, head_dim]
+        v              : [total_tokens, num_kv_heads, head_dim]
+        cu_seqlens     : int32 tensor of cumulative token counts (len num_seqs+1).
+        block_manager  : Shared physical KV cache block pool.
+        seq_ids        : Sequence ID for each batch element.
+        seq_lens_before: Number of tokens already in the cache *before* this
+                         step, per sequence. Used to compute the correct
+                         block/slot offsets for writes.
+        """
+        bm = block_manager
+        block_size = bm.config.block_size
+
+        # TODO: Convert to a single fused kernel to reduce kernel launch overhead. Maybe use cache_ops.reshape_and_cache
+        for i, sid in enumerate(seq_ids):
+            start = int(cu_seqlens[i].item())
+            end = int(cu_seqlens[i + 1].item())
+            num_new = end - start
+            base_pos = seq_lens_before[i]       # token position in the full sequence
+
+            for t in range(num_new):
+                abs_pos = base_pos + t
+                logical_idx = abs_pos // block_size
+                slot_idx = abs_pos % block_size
+
+                # Allocate a new block when we step into an unallocated logical index.
+                if slot_idx == 0 and bm.num_blocks_for_sequence(sid) <= logical_idx:
+                    bm.allocate_block(sid)
+
+                physical_id = bm.get_block_table(sid)[logical_idx]
+                bm.write_slot(
+                    physical_block_id=physical_id,
+                    slot_idx=slot_idx,
+                    layer_idx=self.layer_idx,
+                    k=k[start + t],
+                    v=v[start + t],
+                )
+                # Update filled count so reads reflect written slots.
+                if bm.get_num_filled(physical_id) <= slot_idx:
+                    bm.set_num_filled(physical_id, slot_idx + 1)
+
+    # ------------------------------------------------------------------
+    # Attention
+    # ------------------------------------------------------------------
+
+    def _attention(
         self,
         q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        block_table: torch.Tensor,
     ) -> torch.Tensor:
-        """Flash attention computation over the full prompt. Not yet implemented."""
-        pass
+        """
+        Combined attention for mixed prefill/decode batches.
 
-    def _prefill_paged_kv_write(
-        self,
-        seq_id: int,
-        k: torch.Tensor,
-        v: torch.Tensor,
-    ) -> None:
-        """Write prefill K/V tensors into paged KV blocks. Not yet implemented."""
-        pass
+        Uses flash_attn_varlen_func with a block table to read K/V directly
+        from the contiguous paged cache.
 
-    def _decode_paged_kv_write(
-        self,
-        seq_id: int,
-        k: torch.Tensor,
-        v: torch.Tensor,
-    ) -> None:
-        """Append a single decode-step K/V token into the paged cache. Not yet implemented."""
-        pass
+        Parameters
+        ----------
+        q            : [total_tokens, num_heads, head_dim]
+        k_cache      : [num_blocks, block_size, num_kv_heads, head_dim]
+        v_cache      : [num_blocks, block_size, num_kv_heads, head_dim]
+        cu_seqlens_q : int32 tensor of cumulative query token counts (len num_seqs+1).
+        cu_seqlens_k : int32 tensor of cumulative key token counts (len num_seqs+1).
+        max_seqlen_q : Maximum query sequence length in the batch.
+        max_seqlen_k : Maximum key sequence length in the batch.
+        block_table  : [num_seqs, max_blocks_per_seq] physical block IDs.
 
-    def _decode_paged_flash_attention(
-        self,
-        seq_id: int,
-        q: torch.Tensor,
-    ) -> torch.Tensor:
-        """Paged flash attention over cached K/V blocks during decode. Not yet implemented."""
-        pass
-
-    # ------------------------------------------------------------------
-    # Phase methods
-    # ------------------------------------------------------------------
-
-    def _prefill(
-        self,
-        hidden_states: torch.Tensor,
-        position_ids: Optional[torch.Tensor],
-    ) -> Optional[torch.Tensor]:
-        q, k, v = self._project(hidden_states)
-        q, k    = self._apply_rotary(q, k, position_ids)
-
-        for i, seq_id in enumerate(self._block_table):
-            self._prefill_paged_kv_write(seq_id, k[i], v[i])
-
-        return self._prefill_flash_attention(q, k, v)
-
-    def _decode(
-        self,
-        hidden_states: torch.Tensor,
-        position_ids: Optional[torch.Tensor],
-    ) -> Optional[torch.Tensor]:
-        q, k, v = self._project(hidden_states)
-        q, k    = self._apply_rotary(q, k, position_ids)
-
-        attn_outs = []
-        for i, seq_id in enumerate(self._block_table):
-            self._decode_paged_kv_write(seq_id, k[i], v[i])
-            attn_outs.append(self._decode_paged_flash_attention(seq_id, q[i]))
-
-        # attn_outs is a list of per-sequence outputs; stacking is deferred until
-        # _decode_paged_flash_attention is implemented and returns real tensors.
-        return None
+        Returns
+        -------
+        out : [total_tokens, num_heads, head_dim]
+        """
+        from flash_attn import flash_attn_varlen_func
+        return flash_attn_varlen_func(
+            q,
+            k_cache,
+            v_cache,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            causal=True,
+            block_table=block_table,
+        )
 
     # ------------------------------------------------------------------
-    # Forward — HF-compatible signature
+    # Forward
     # ------------------------------------------------------------------
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value=None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        **kwargs,
-    ) -> Tuple[Optional[torch.Tensor], None, None]:
-        if self._is_prefill:
-            attn_out = self._prefill(hidden_states, position_ids)
-        else:
-            attn_out = self._decode(hidden_states, position_ids)
+        position_ids: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        block_manager: BlockManager,
+        seq_ids: List[int],
+        seq_lens: List[int],
+    ) -> torch.Tensor:
+        """
+        Forward pass on a packed 1-D token buffer.
 
-        # Apply output projection once kernels are implemented and attn_out is real.
-        if attn_out is not None:
-            bsz, _, seq_len, _ = attn_out.shape
-            attn_out = attn_out.transpose(1, 2).contiguous().view(
-                bsz, seq_len, self.num_heads * self.head_dim
-            )
-            attn_out = self.o_proj(attn_out)
+        Parameters
+        ----------
+        hidden_states : [total_tokens, hidden]
+            Packed token representations from all sequences in the batch.
+        position_ids  : [total_tokens]
+            Absolute position of each token within its sequence.
+        cu_seqlens    : [num_seqs + 1], int32
+            Cumulative token counts. Sequence *i* occupies
+            hidden_states[cu_seqlens[i] : cu_seqlens[i+1]].
+        block_manager : Shared physical KV cache block pool.
+        seq_ids       : Sequence ID for each element in the batch.
+        seq_lens      : Number of tokens already cached *before* this step,
+                        per sequence.
 
-        return attn_out, None, None
+        Returns
+        -------
+        out : [total_tokens, hidden]
+        """
+        # --- 1. Project + rotary ---
+        q, kv = self._project(hidden_states)
+        k, v = kv[:, 0], kv[:, 1]     # [total_tokens, num_kv_heads, head_dim]
+        q, k = self._apply_rotary(q, k, position_ids.unsqueeze(0))
+
+        # --- 2. Write K/V into paged cache ---
+        self._write_kv_to_paged_cache(k, v, cu_seqlens, block_manager, seq_ids, seq_lens)
+
+        # --- 3. Build block table and compute total KV lengths (including new tokens) ---
+        input_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+        total_seq_lens = [s + n for s, n in zip(seq_lens, input_lens)]
+        block_table = self._build_block_table_tensor(
+            block_manager, seq_ids, total_seq_lens, hidden_states.device,
+        )
+
+        # --- 4. Attention ---
+        max_seqlen_q = max(input_lens)
+        max_seqlen_k = max(total_seq_lens)
+
+        # cu_seqlens_k covers the full KV lengths (cached + new)
+        cu_seqlens_k = torch.zeros(
+            len(seq_ids) + 1, device=hidden_states.device, dtype=torch.int32,
+        )
+        torch.cumsum(
+            torch.tensor(total_seq_lens, device=hidden_states.device, dtype=torch.int32),
+            dim=0,
+            out=cu_seqlens_k[1:],
+        )
+
+        # K/V are read directly from the contiguous paged cache by the kernel.
+        k_cache, v_cache = block_manager.get_kv_cache(self.layer_idx)
+
+        attn_out = self._attention(
+            q, k_cache, v_cache,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            block_table=block_table,
+        )
+
+        # --- 5. Output projection ---
+        # attn_out: [total_tokens, num_heads, head_dim] → [total_tokens, hidden]
+        attn_flat = attn_out.reshape(attn_out.shape[0], self.num_heads * self.head_dim)
+        return self.o_proj(attn_flat)
