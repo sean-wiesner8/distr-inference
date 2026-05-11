@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from distr_inference.paged_attention import PagedAttention, _rotate_half
+from distr_inference.attention import PagedAttention, _rotate_half
 from distr_inference.block_manager import BlockManager
 from distr_inference.kv_cache import KVBlockConfig
 
