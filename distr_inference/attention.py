@@ -211,10 +211,14 @@ class PagedAttention(nn.Module):
         bm = block_manager
         block_size = bm.config.block_size
 
+        # Pull cu_seqlens to the host once; indexing a GPU tensor per element
+        # below would force a device->host sync on every access.
+        cu = cu_seqlens.tolist()
+
         # TODO: Convert to a single fused kernel to reduce kernel launch overhead. Maybe use cache_ops.reshape_and_cache
         for i, sid in enumerate(seq_ids):
-            start = int(cu_seqlens[i].item())
-            end = int(cu_seqlens[i + 1].item())
+            start = cu[i]
+            end = cu[i + 1]
             num_new = end - start
             base_pos = seq_lens_before[i]       # token position in the full sequence
 
