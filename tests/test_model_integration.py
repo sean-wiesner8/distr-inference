@@ -60,11 +60,18 @@ def test_prefill_matches_hf_reference():
     with torch.no_grad():
         our_logits = model(input_ids, position_ids, cu_seqlens, bm, [0], [0])  # [T, V]
 
-    hf = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=DTYPE).to(DEVICE).eval()
+    hf = AutoModelForCausalLM.from_pretrained(
+        MODEL_ID, torch_dtype=DTYPE, attn_implementation="flash_attention_2",
+    ).to(DEVICE).eval()
     with torch.no_grad():
         hf_logits = hf(ids_2d).logits[0]  # [T, V]
 
     assert our_logits.shape == hf_logits.shape
+
+    our_top = our_logits[-1].topk(5)
+    hf_top  = hf_logits[-1].topk(5)
+    print(f"\nour top-5 token ids: {our_top.indices.tolist()}  values: {our_top.values.float().tolist()}")
+    print(f"hf  top-5 token ids: {hf_top.indices.tolist()}  values: {hf_top.values.float().tolist()}")
 
     last_diff = (our_logits[-1].float() - hf_logits[-1].float()).abs().max().item()
     assert last_diff < 5e-2, f"last-position logit drift {last_diff:.4f} exceeds bf16 tolerance"
