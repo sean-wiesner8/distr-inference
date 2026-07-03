@@ -42,11 +42,11 @@ def test_prefill_matches_hf_reference():
         num_layers=hf_cfg.num_hidden_layers,
         num_kv_heads=hf_cfg.num_key_value_heads,
         head_dim=head_dim,
-        block_size=16,
+        block_size=256,
         dtype=DTYPE,
         device=str(DEVICE),
     )
-    bm = BlockManager(num_blocks=64, config=kv_cfg)
+    bm = BlockManager(num_blocks=8, config=kv_cfg)
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
     ids_2d = tokenizer(PROMPT, return_tensors="pt").input_ids.to(DEVICE)  # [1, T]
