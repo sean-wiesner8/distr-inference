@@ -42,7 +42,7 @@ def test_prefill_matches_hf_reference():
         num_layers=hf_cfg.num_hidden_layers,
         num_kv_heads=hf_cfg.num_key_value_heads,
         head_dim=head_dim,
-        block_size=256,
+        block_size=256, # TODO: lower block size to 16. Need to modify flash attention implementation to support block_size < 256
         dtype=DTYPE,
         device=str(DEVICE),
     )
