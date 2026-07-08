@@ -8,6 +8,9 @@ from .sequence import (
     SequenceIdAllocator,
     RequestQueue,
 )
+from .sampler import sample_token
+from .scheduler import Scheduler, SchedulerConfig
+from .engine import LLMEngine
 
 __all__ = [
     "KVBlockConfig",
@@ -20,4 +23,8 @@ __all__ = [
     "Sequence",
     "SequenceIdAllocator",
     "RequestQueue",
+    "sample_token",
+    "Scheduler",
+    "SchedulerConfig",
+    "LLMEngine",
 ]
