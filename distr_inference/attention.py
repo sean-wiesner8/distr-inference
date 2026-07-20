@@ -261,7 +261,7 @@ class PagedAttention(nn.Module):
         """
         Combined attention for mixed prefill/decode batches.
 
-        Uses flash_attn_varlen_func with a block table to read K/V directly
+        Uses vllm_flash_attn's flash_attn_varlen_func with a block table to read K/V directly
         from the contiguous paged cache.
 
         Parameters
@@ -279,7 +279,9 @@ class PagedAttention(nn.Module):
         -------
         out : [total_tokens, num_heads, head_dim]
         """
-        from flash_attn import flash_attn_varlen_func
+        # vLLM's fork rather than upstream flash-attn: upstream requires the
+        # paged block size to be divisible by 256, the fork only requires 16.
+        from vllm_flash_attn import flash_attn_varlen_func
         return flash_attn_varlen_func(
             q,
             k_cache,

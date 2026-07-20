@@ -19,7 +19,9 @@ Two properties are checked:
      greedy output to running each prompt alone. This is drift-free (it
      compares our engine to itself) and exercises the scheduler end to end.
 
-Requires CUDA + flash-attn + HF auth for the model. Skipped otherwise.
+Requires CUDA + HF auth for the model. Skipped otherwise. Needs both
+vllm-flash-attn (our paged kernel) and upstream flash-attn (the HF reference
+runs with attn_implementation="flash_attention_2").
 """
 
 import os
@@ -27,6 +29,7 @@ import os
 import pytest
 import torch
 
+vllm_flash_attn = pytest.importorskip("vllm_flash_attn")
 flash_attn = pytest.importorskip("flash_attn")
 if not torch.cuda.is_available():
     pytest.skip("CUDA required for paged attention", allow_module_level=True)
@@ -81,7 +84,7 @@ def make_block_manager(hf_cfg):
         num_layers=hf_cfg.num_hidden_layers,
         num_kv_heads=hf_cfg.num_key_value_heads,
         head_dim=head_dim,
-        block_size=256,  # flash-attn paged kernel requires block_size >= 256 here
+        block_size=16,
         dtype=DTYPE,
         device=str(DEVICE),
     )

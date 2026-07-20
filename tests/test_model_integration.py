@@ -5,7 +5,9 @@ Loads Llama-3.2-1B (or an override via DISTR_INFERENCE_MODEL_ID) into our
 LlamaModel via the weight loader and compares the logits of a packed one-
 sequence forward pass against the HF reference model on the same prompt.
 
-Requires CUDA + flash-attn + HF auth for the model. Skipped otherwise.
+Requires CUDA + HF auth for the model. Skipped otherwise. Needs both
+vllm-flash-attn (our paged kernel) and upstream flash-attn (the HF reference
+runs with attn_implementation="flash_attention_2").
 """
 
 import os
@@ -13,6 +15,7 @@ import os
 import pytest
 import torch
 
+vllm_flash_attn = pytest.importorskip("vllm_flash_attn")
 flash_attn = pytest.importorskip("flash_attn")
 if not torch.cuda.is_available():
     pytest.skip("CUDA required for paged attention", allow_module_level=True)
@@ -42,7 +45,7 @@ def test_prefill_matches_hf_reference():
         num_layers=hf_cfg.num_hidden_layers,
         num_kv_heads=hf_cfg.num_key_value_heads,
         head_dim=head_dim,
-        block_size=256, # TODO: lower block size to 16. Need to modify flash attention implementation to support block_size < 256
+        block_size=16,
         dtype=DTYPE,
         device=str(DEVICE),
     )
