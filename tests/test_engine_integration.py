@@ -11,17 +11,19 @@ Two properties are checked:
      decode analog of the prefill logits test. We compare logits rather than
      asserting token-for-token greedy equality because greedy argmax is a step
      function: two numerically-close-but-not-identical attention kernels (our
-     paged flash-attn vs HF's contiguous flash-attn-2) inevitably flip a
-     near-tie a few steps in, after which the sequences diverge irrecoverably.
+     paged flash-attn vs HF's eager materialized-softmax attention) inevitably
+     flip a near-tie a few steps in, after which the sequences diverge
+     irrecoverably.
      Teacher forcing keeps both models on one sequence so errors stay per-step.
   2. Batching invariance — running several prompts *concurrently* (mixed
      prefill/decode, admission, eviction) yields token-for-token identical
      greedy output to running each prompt alone. This is drift-free (it
      compares our engine to itself) and exercises the scheduler end to end.
 
-Requires CUDA + HF auth for the model. Skipped otherwise. Needs both
-vllm-flash-attn (our paged kernel) and upstream flash-attn (the HF reference
-runs with attn_implementation="flash_attention_2").
+Requires CUDA + HF auth for the model. Skipped otherwise. Needs vLLM's paged
+flash-attn kernel; the HF reference runs with attn_implementation="eager"
+so the comparison target is plain materialized-softmax attention and the test
+carries no upstream flash-attn dependency.
 """
 
 import os
@@ -29,8 +31,15 @@ import os
 import pytest
 import torch
 
-vllm_flash_attn = pytest.importorskip("vllm_flash_attn")
-flash_attn = pytest.importorskip("flash_attn")
+try:
+    from distr_inference.attention import load_flash_attn_varlen_func
+
+    load_flash_attn_varlen_func()
+except ImportError:
+    pytest.skip(
+        "vLLM's paged flash-attn required (vllm-flash-attn or vllm)",
+        allow_module_level=True,
+    )
 if not torch.cuda.is_available():
     pytest.skip("CUDA required for paged attention", allow_module_level=True)
 
@@ -54,7 +63,7 @@ PROMPTS = [
 ]
 MAX_TOKENS = 10
 
-# Per-step logit drift budget between our paged kernel and HF's flash-attn-2,
+# Per-step logit drift budget between our paged kernel and HF's eager attention,
 # matching the prefill test's tolerance (see test_model_integration.py). A touch
 # looser because we check every decode step, not just the confident last one.
 LOGIT_TOL = 3e-1
@@ -113,7 +122,7 @@ def test_decode_logits_match_hf_reference(model, hf_cfg, tokenizer):
     T = len(prompt_ids)
 
     hf = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID, torch_dtype=DTYPE, attn_implementation="flash_attention_2",
+        MODEL_ID, torch_dtype=DTYPE, attn_implementation="eager",
     ).to(DEVICE).eval()
 
     # HF greedy continuation defines the token path both models are teacher-

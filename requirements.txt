@@ -1,7 +1,20 @@
-torch>=2.6
+# torch must be a CUDA 12.x build: the PyPI default is now a CUDA 13 wheel, which
+# needs a newer driver than the 12.8 our boxes run. On too-old drivers torch does
+# not fail loudly -- it just reports no CUDA devices and everything GPU skips.
+# 2.11 also matches what vLLM's flash-attention fork currently targets.
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.11.0+cu128
+
+# The paged flash-attn kernel is NOT installable from PyPI and is deliberately
+# absent here -- build it after this file with:
+#
+#     ./scripts/build_vllm_flash_attn.sh
+#
+# See that script's header for why neither `vllm-flash-attn` nor `vllm` works
+# as a pin. Without it the GPU and integration tests skip rather than fail.
+
 transformers>=4.46,<5
 accelerate
-vllm-flash-attn
 fastapi
 pydantic
 uvicorn

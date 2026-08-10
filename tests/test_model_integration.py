@@ -5,9 +5,10 @@ Loads Llama-3.2-1B (or an override via DISTR_INFERENCE_MODEL_ID) into our
 LlamaModel via the weight loader and compares the logits of a packed one-
 sequence forward pass against the HF reference model on the same prompt.
 
-Requires CUDA + HF auth for the model. Skipped otherwise. Needs both
-vllm-flash-attn (our paged kernel) and upstream flash-attn (the HF reference
-runs with attn_implementation="flash_attention_2").
+Requires CUDA + HF auth for the model. Skipped otherwise. Needs vLLM's paged
+flash-attn kernel; the HF reference runs with attn_implementation="eager"
+so the comparison target is plain materialized-softmax attention and the test
+carries no upstream flash-attn dependency.
 """
 
 import os
@@ -15,8 +16,15 @@ import os
 import pytest
 import torch
 
-vllm_flash_attn = pytest.importorskip("vllm_flash_attn")
-flash_attn = pytest.importorskip("flash_attn")
+try:
+    from distr_inference.attention import load_flash_attn_varlen_func
+
+    load_flash_attn_varlen_func()
+except ImportError:
+    pytest.skip(
+        "vLLM's paged flash-attn required (vllm-flash-attn or vllm)",
+        allow_module_level=True,
+    )
 if not torch.cuda.is_available():
     pytest.skip("CUDA required for paged attention", allow_module_level=True)
 
@@ -64,7 +72,7 @@ def test_prefill_matches_hf_reference():
         our_logits = model(input_ids, position_ids, cu_seqlens, bm, [0], [0])  # [T, V]
 
     hf = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID, torch_dtype=DTYPE, attn_implementation="flash_attention_2",
+        MODEL_ID, torch_dtype=DTYPE, attn_implementation="eager",
     ).to(DEVICE).eval()
     with torch.no_grad():
         hf_logits = hf(ids_2d).logits[0]  # [T, V]

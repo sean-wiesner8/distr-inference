@@ -39,6 +39,29 @@ import torch.nn as nn
 from .block_manager import BlockManager
 
 
+def load_flash_attn_varlen_func():
+    """
+    Resolve vLLM's paged flash-attn kernel.
+
+    Normally this is the standalone build produced by
+    ``scripts/build_vllm_flash_attn.sh`` -- the PyPI distribution of the same
+    name is abandoned (2.6.2, pinned to torch 2.4), so a standalone module being
+    importable means someone compiled it against this environment's torch.
+
+    Falls back to the copy vendored inside ``vllm``, which exposes the same
+    function, so the library still works in an environment that installed full
+    vLLM instead of running the build script.
+
+    Imported lazily rather than at module scope so CPU-only tests can import
+    this module and monkeypatch the attention call without the package present.
+    """
+    try:
+        from vllm_flash_attn import flash_attn_varlen_func
+    except ImportError:
+        from vllm.vllm_flash_attn import flash_attn_varlen_func
+    return flash_attn_varlen_func
+
+
 # ---------------------------------------------------------------------------
 # Rotary helpers (self-contained; avoids coupling to HF model internals)
 # ---------------------------------------------------------------------------
@@ -281,7 +304,7 @@ class PagedAttention(nn.Module):
         """
         # vLLM's fork rather than upstream flash-attn: upstream requires the
         # paged block size to be divisible by 256, the fork only requires 16.
-        from vllm_flash_attn import flash_attn_varlen_func
+        flash_attn_varlen_func = load_flash_attn_varlen_func()
         return flash_attn_varlen_func(
             q,
             k_cache,

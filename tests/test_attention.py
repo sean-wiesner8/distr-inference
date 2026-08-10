@@ -446,14 +446,16 @@ def test_forward_mixed_batch():
 
 _has_cuda = torch.cuda.is_available()
 try:
-    from vllm_flash_attn import flash_attn_varlen_func as _real_fn  # noqa: F401
+    from distr_inference.attention import load_flash_attn_varlen_func
+
+    load_flash_attn_varlen_func()
     _has_flash_attn = True
 except ImportError:
     _has_flash_attn = False
 
 requires_gpu = pytest.mark.skipif(
     not (_has_cuda and _has_flash_attn),
-    reason="Requires CUDA GPU and vllm-flash-attn",
+    reason="Requires CUDA GPU and vLLM's paged flash-attn (vllm-flash-attn or vllm)",
 )
 
 
