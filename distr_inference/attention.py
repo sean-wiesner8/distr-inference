@@ -276,7 +276,7 @@ class PagedAttention(nn.Module):
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         cu_seqlens_q: torch.Tensor,
-        cu_seqlens_k: torch.Tensor,
+        seqused_k: torch.Tensor,
         max_seqlen_q: int,
         max_seqlen_k: int,
         block_table: torch.Tensor,
@@ -293,7 +293,9 @@ class PagedAttention(nn.Module):
         k_cache      : [num_blocks, block_size, num_kv_heads, head_dim]
         v_cache      : [num_blocks, block_size, num_kv_heads, head_dim]
         cu_seqlens_q : int32 tensor of cumulative query token counts (len num_seqs+1).
-        cu_seqlens_k : int32 tensor of cumulative key token counts (len num_seqs+1).
+        seqused_k    : int32 tensor of per-sequence key token counts (len num_seqs).
+                       The fork requires this instead of cu_seqlens_k when a
+                       block_table is given.
         max_seqlen_q : Maximum query sequence length in the batch.
         max_seqlen_k : Maximum key sequence length in the batch.
         block_table  : [num_seqs, max_blocks_per_seq] physical block IDs.
@@ -310,7 +312,7 @@ class PagedAttention(nn.Module):
             k_cache,
             v_cache,
             cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
+            seqused_k=seqused_k,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             causal=True,
@@ -370,14 +372,10 @@ class PagedAttention(nn.Module):
         max_seqlen_q = max(input_lens)
         max_seqlen_k = max(total_seq_lens)
 
-        # cu_seqlens_k covers the full KV lengths (cached + new)
-        cu_seqlens_k = torch.zeros(
-            len(seq_ids) + 1, device=hidden_states.device, dtype=torch.int32,
-        )
-        torch.cumsum(
-            torch.tensor(total_seq_lens, device=hidden_states.device, dtype=torch.int32),
-            dim=0,
-            out=cu_seqlens_k[1:],
+        # Per-sequence KV lengths (cached + new). The paged path takes these as
+        # seqused_k rather than cumulative cu_seqlens_k.
+        seqused_k = torch.tensor(
+            total_seq_lens, device=hidden_states.device, dtype=torch.int32,
         )
 
         # K/V are read directly from the contiguous paged cache by the kernel.
@@ -386,7 +384,7 @@ class PagedAttention(nn.Module):
         attn_out = self._attention(
             q, k_cache, v_cache,
             cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens_k,
+            seqused_k=seqused_k,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             block_table=block_table,
