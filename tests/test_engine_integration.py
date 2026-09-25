@@ -75,11 +75,15 @@ BLOCK_SIZE = 16
 # looser because we check every decode step, not just the confident last one.
 LOGIT_TOL = 3e-1
 
-# Per-step logit drift budget between batched and alone runs of our own engine.
-# Only bf16 batch-variance noise (~1e-2) should show up here; a real batching
-# bug (cross-sequence KV reads, wrong positions / seq_lens) drifts by whole
-# logits.
-BATCH_TOL = 1e-1
+# Per-logit drift budget between batched and alone runs of our own engine:
+# |batched - alone| <= BATCH_ATOL + BATCH_RTOL * |alone|. Only bf16
+# batch-variance noise should show up here, which is a few ULPs — and a bf16
+# ULP scales with magnitude (7 mantissa bits: 0.125 for logits in [16, 32)),
+# so the budget must be relative. BATCH_RTOL = 2**-6 is two ULPs. A real
+# batching bug (cross-sequence KV reads, wrong positions / seq_lens) drifts by
+# whole logits.
+BATCH_RTOL = 2 ** -6
+BATCH_ATOL = 2 ** -4
 
 
 @pytest.fixture(scope="module")
@@ -281,8 +285,12 @@ def test_batched_matches_sequential(model, hf_cfg, tokenizer):
     for i in range(len(PROMPTS)):
         assert len(batched_logits[i]) == len(alone_logits[i]) == MAX_TOKENS
         for k, (b, a) in enumerate(zip(batched_logits[i], alone_logits[i])):
-            max_diff = (b - a).abs().max().item()
-            assert max_diff < BATCH_TOL, (
+            diff = (b - a).abs()
+            excess = diff - (BATCH_ATOL + BATCH_RTOL * a.abs())
+            worst = int(excess.argmax())
+            assert excess[worst] <= 0, (
                 f"prompt {i} step {k} (predicting position {len(prompt_ids[i]) + k}): "
-                f"batched vs alone logit drift {max_diff:.4f} exceeds {BATCH_TOL}"
+                f"token {worst} logit drift {diff[worst]:.4f} (alone {a[worst]:.4f}, "
+                f"batched {b[worst]:.4f}) exceeds "
+                f"{BATCH_ATOL} + {BATCH_RTOL} * |alone|"
             )
