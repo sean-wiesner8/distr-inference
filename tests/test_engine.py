@@ -146,6 +146,28 @@ def test_late_arrival_joins_running_batch():
     assert not engine.has_unfinished()
 
 
+def test_custom_sampler_overrides_sampling():
+    # Force a fixed token path regardless of the stub's peaked logits; the
+    # forced tokens must also be what gets fed back on the next decode.
+    forced = [3, 9, 1]
+    seen_rows = []
+
+    def sampler(seq, logits):
+        seen_rows.append(logits.shape)
+        return forced[seq.num_output_tokens]
+
+    bm = BlockManager(num_blocks=64, config=CONFIG)
+    model = StubModel()
+    engine = LLMEngine.build(model, bm, SchedulerConfig(), device="cpu", sampler=sampler)
+    engine.add_request([1, 2], greedy(max_tokens=3))
+
+    finished = engine.run_to_completion()
+
+    assert finished[0].output_token_ids == forced
+    assert seen_rows == [torch.Size([VOCAB])] * 3      # one logits row per step
+    assert [c["input_ids"] for c in model.calls[1:]] == [[3], [9]]
+
+
 def test_finished_sequences_free_blocks_for_waiting():
     # Tight cache: 2 blocks (block_size 4). Two 4-token prompts fill it; a third
     # can only be admitted after one finishes and frees its block.

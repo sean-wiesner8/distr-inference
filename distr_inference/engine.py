@@ -39,6 +39,15 @@ ModelFn = Callable[
     torch.Tensor,
 ]
 
+# Picks the next token for a sequence from its last-position logits row.
+#   (seq, logits [vocab_size]) -> token_id
+SamplerFn = Callable[[Sequence, torch.Tensor], int]
+
+
+def default_sampler(seq: Sequence, logits: torch.Tensor) -> int:
+    """Sample under the sequence's own :class:`SamplingParams`."""
+    return sample_token(logits, seq.sampling_params)
+
 
 class LLMEngine:
     """
@@ -50,6 +59,8 @@ class LLMEngine:
     block_manager : Shared paged KV cache allocator.
     scheduler     : Continuous-batching scheduler over ``block_manager``.
     device        : Device for the packed input tensors (must match the model).
+    sampler       : Token picker; defaults to :func:`default_sampler`. Tests
+                    override it to record logits or force a token path.
     """
 
     def __init__(
@@ -58,11 +69,13 @@ class LLMEngine:
         block_manager: BlockManager,
         scheduler: Scheduler,
         device: torch.device | str = "cuda",
+        sampler: SamplerFn = default_sampler,
     ) -> None:
         self.model = model
         self.block_manager = block_manager
         self.scheduler = scheduler
         self.device = torch.device(device)
+        self.sampler = sampler
         self._ids = SequenceIdAllocator()
 
     # ------------------------------------------------------------------
@@ -76,10 +89,11 @@ class LLMEngine:
         block_manager: BlockManager,
         scheduler_config: SchedulerConfig,
         device: torch.device | str = "cuda",
+        sampler: SamplerFn = default_sampler,
     ) -> "LLMEngine":
         """Convenience constructor that wires up the scheduler."""
         scheduler = Scheduler(block_manager, scheduler_config)
-        return cls(model, block_manager, scheduler, device)
+        return cls(model, block_manager, scheduler, device, sampler)
 
     # ------------------------------------------------------------------
     # Submission
@@ -173,7 +187,7 @@ class LLMEngine:
             # The forward pass wrote every uncached token into the cache; the
             # watermark advances before the newly sampled token is appended.
             seq.advance_cache(seq.num_uncached_tokens)
-            token_id = sample_token(last_logits[i], seq.sampling_params)
+            token_id = self.sampler(seq, last_logits[i])
             seq.append_token(token_id)
 
         return self.scheduler.free_finished()

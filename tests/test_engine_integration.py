@@ -15,10 +15,14 @@ Two properties are checked:
      flip a near-tie a few steps in, after which the sequences diverge
      irrecoverably.
      Teacher forcing keeps both models on one sequence so errors stay per-step.
-  2. Batching invariance — running several prompts *concurrently* (mixed
-     prefill/decode, admission, eviction) yields token-for-token identical
-     greedy output to running each prompt alone. This is drift-free (it
-     compares our engine to itself) and exercises the scheduler end to end.
+  2. Batching invariance — running several prompts *concurrently* yields the
+     same per-step logits as running each prompt alone. Requests are admitted
+     staggered so later prefills pack into the same forward pass as earlier
+     sequences' decodes, and generation runs long enough to cross a KV block
+     boundary. Both runs are teacher-forced along the alone run's greedy path:
+     bf16 matmuls are not batch-invariant (cuBLAS picks shape-dependent
+     reduction orders), so free-running greedy output can legitimately flip a
+     near-tie token under batching, after which nothing more is comparable.
 
 Requires CUDA + HF auth for the model. Skipped otherwise. Needs vLLM's paged
 flash-attn kernel; the HF reference runs with attn_implementation="eager"
@@ -61,12 +65,21 @@ PROMPTS = [
     "Water is made of hydrogen and",
     "The opposite of hot is",
 ]
-MAX_TOKENS = 10
+# Long enough that every prompt (~6-8 tokens) crosses into a second KV block
+# mid-decode, exercising lazy block allocation under batching.
+MAX_TOKENS = 20
+BLOCK_SIZE = 16
 
 # Per-step logit drift budget between our paged kernel and HF's eager attention,
 # matching the prefill test's tolerance (see test_model_integration.py). A touch
 # looser because we check every decode step, not just the confident last one.
 LOGIT_TOL = 3e-1
+
+# Per-step logit drift budget between batched and alone runs of our own engine.
+# Only bf16 batch-variance noise (~1e-2) should show up here; a real batching
+# bug (cross-sequence KV reads, wrong positions / seq_lens) drifts by whole
+# logits.
+BATCH_TOL = 1e-1
 
 
 @pytest.fixture(scope="module")
@@ -93,19 +106,20 @@ def make_block_manager(hf_cfg):
         num_layers=hf_cfg.num_hidden_layers,
         num_kv_heads=hf_cfg.num_key_value_heads,
         head_dim=head_dim,
-        block_size=16,
+        block_size=BLOCK_SIZE,
         dtype=DTYPE,
         device=str(DEVICE),
     )
     return BlockManager(num_blocks=16, config=kv_cfg)
 
 
-def make_engine(model, hf_cfg):
+def make_engine(model, hf_cfg, sampler):
     return LLMEngine.build(
         model,
         make_block_manager(hf_cfg),
         SchedulerConfig(max_num_seqs=8, max_num_batched_tokens=2048),
         device=DEVICE,
+        sampler=sampler,
     )
 
 
@@ -192,32 +206,83 @@ def test_decode_logits_match_hf_reference(model, hf_cfg, tokenizer):
 # 2. Continuous batching is invariant to how requests are grouped
 # ---------------------------------------------------------------------------
 
+# Engine step at which each prompt is submitted in the batched run. Staggering
+# makes later prefills share a forward pass with earlier sequences' decodes.
+ADMIT_STEP = {0: 0, 1: 2, 2: 5}
+
+
+class BatchRecorder:
+    """Wraps the model to record each forward pass's ``seq_lens``."""
+
+    def __init__(self, model):
+        self.model = model
+        self.seq_lens_per_step = []
+
+    def __call__(self, input_ids, position_ids, cu_seqlens, bm, seq_ids, seq_lens):
+        self.seq_lens_per_step.append(list(seq_lens))
+        return self.model(input_ids, position_ids, cu_seqlens, bm, seq_ids, seq_lens)
+
+
 def test_batched_matches_sequential(model, hf_cfg, tokenizer):
     prompt_ids = [encode(tokenizer, p) for p in PROMPTS]
-    sp = lambda: SamplingParams(temperature=0.0, max_tokens=MAX_TOKENS)
+    sp = SamplingParams(temperature=0.0, max_tokens=MAX_TOKENS)
 
-    # Run each prompt alone.
-    alone = {}
+    # Every prompt must fit in one block at prefill and spill into a second
+    # during decode, so lazy block allocation runs mid-batch.
+    for ids in prompt_ids:
+        assert len(ids) < BLOCK_SIZE < len(ids) + MAX_TOKENS
+
+    # --- Alone: greedy per prompt; its tokens define the reference path. ---
+    alone_logits = {}
+    alone_tokens = {}
     for i, ids in enumerate(prompt_ids):
-        engine = make_engine(model, hf_cfg)
-        engine.add_request(ids, sp())
+        logs = []
+
+        def greedy_recording(seq, logits, logs=logs):
+            logs.append(logits.float().cpu())
+            return int(logits.argmax())
+
+        engine = make_engine(model, hf_cfg, greedy_recording)
+        engine.add_request(ids, sp)
         with torch.no_grad():
             finished = engine.run_to_completion()
-        alone[i] = finished[0].output_token_ids
+        alone_logits[i] = logs
+        alone_tokens[i] = finished[0].output_token_ids
 
-    # Run all prompts concurrently through one engine.
-    engine = make_engine(model, hf_cfg)
+    # --- Batched: staggered admission, forced along each alone path. ---
     sid_to_idx = {}
-    for i, ids in enumerate(prompt_ids):
-        sid = engine.add_request(ids, sp())
-        sid_to_idx[sid] = i
+    batched_logits = {i: [] for i in range(len(PROMPTS))}
+
+    def forced_recording(seq, logits):
+        i = sid_to_idx[seq.seq_id]
+        batched_logits[i].append(logits.float().cpu())
+        return alone_tokens[i][seq.num_output_tokens]
+
+    recorder = BatchRecorder(model)
+    engine = make_engine(recorder, hf_cfg, forced_recording)
+    pending = dict(ADMIT_STEP)
+    step = 0
     with torch.no_grad():
-        finished = engine.run_to_completion()
+        while pending or engine.has_unfinished():
+            for i in [i for i, s in pending.items() if s <= step]:
+                sid_to_idx[engine.add_request(prompt_ids[i], sp)] = i
+                del pending[i]
+            engine.step()
+            step += 1
 
-    batched = {sid_to_idx[s.seq_id]: s.output_token_ids for s in finished}
+    # The stagger must have produced at least one mixed prefill+decode batch.
+    mixed = [
+        lens for lens in recorder.seq_lens_per_step
+        if any(n == 0 for n in lens) and any(n > 0 for n in lens)
+    ]
+    assert mixed, f"no mixed prefill/decode batch: {recorder.seq_lens_per_step}"
 
-    assert len(batched) == len(PROMPTS)
+    # --- Per-step logits must agree up to bf16 batch-variance noise. ---
     for i in range(len(PROMPTS)):
-        assert batched[i] == alone[i], (
-            f"prompt {i!r}: batched {batched[i]} != sequential {alone[i]}"
-        )
+        assert len(batched_logits[i]) == len(alone_logits[i]) == MAX_TOKENS
+        for k, (b, a) in enumerate(zip(batched_logits[i], alone_logits[i])):
+            max_diff = (b - a).abs().max().item()
+            assert max_diff < BATCH_TOL, (
+                f"prompt {i} step {k} (predicting position {len(prompt_ids[i]) + k}): "
+                f"batched vs alone logit drift {max_diff:.4f} exceeds {BATCH_TOL}"
+            )
