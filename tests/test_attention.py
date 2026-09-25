@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from distr_inference.paged_attention import PagedAttention, _rotate_half
+from distr_inference.attention import PagedAttention, _rotate_half
 from distr_inference.block_manager import BlockManager
 from distr_inference.kv_cache import KVBlockConfig
 
@@ -446,14 +446,16 @@ def test_forward_mixed_batch():
 
 _has_cuda = torch.cuda.is_available()
 try:
-    from flash_attn import flash_attn_varlen_func as _real_fn  # noqa: F401
+    from distr_inference.attention import load_flash_attn_varlen_func
+
+    load_flash_attn_varlen_func()
     _has_flash_attn = True
 except ImportError:
     _has_flash_attn = False
 
 requires_gpu = pytest.mark.skipif(
     not (_has_cuda and _has_flash_attn),
-    reason="Requires CUDA GPU and flash-attn",
+    reason="Requires CUDA GPU and vLLM's paged flash-attn (vllm-flash-attn or vllm)",
 )
 
 
@@ -461,7 +463,7 @@ requires_gpu = pytest.mark.skipif(
 def test_attention_output_shape_gpu():
     cfg = KVBlockConfig(
         num_layers=NUM_LAYERS, num_kv_heads=NUM_KV_HEADS, head_dim=HEAD_DIM,
-        block_size=256, dtype=torch.bfloat16, device="cuda",
+        block_size=16, dtype=torch.bfloat16, device="cuda",
     )
     bm = BlockManager(num_blocks=16, config=cfg)
     attn = PagedAttention(
@@ -488,7 +490,7 @@ def test_attention_output_shape_gpu():
 def test_forward_end_to_end_gpu():
     cfg = KVBlockConfig(
         num_layers=NUM_LAYERS, num_kv_heads=NUM_KV_HEADS, head_dim=HEAD_DIM,
-        block_size=256, dtype=torch.bfloat16, device="cuda",
+        block_size=16, dtype=torch.bfloat16, device="cuda",
     )
     bm = BlockManager(num_blocks=16, config=cfg)
     attn = PagedAttention(

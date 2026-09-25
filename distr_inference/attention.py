@@ -39,6 +39,29 @@ import torch.nn as nn
 from .block_manager import BlockManager
 
 
+def load_flash_attn_varlen_func():
+    """
+    Resolve vLLM's paged flash-attn kernel.
+
+    Normally this is the standalone build produced by
+    ``scripts/build_vllm_flash_attn.sh`` -- the PyPI distribution of the same
+    name is abandoned (2.6.2, pinned to torch 2.4), so a standalone module being
+    importable means someone compiled it against this environment's torch.
+
+    Falls back to the copy vendored inside ``vllm``, which exposes the same
+    function, so the library still works in an environment that installed full
+    vLLM instead of running the build script.
+
+    Imported lazily rather than at module scope so CPU-only tests can import
+    this module and monkeypatch the attention call without the package present.
+    """
+    try:
+        from vllm_flash_attn import flash_attn_varlen_func
+    except ImportError:
+        from vllm.vllm_flash_attn import flash_attn_varlen_func
+    return flash_attn_varlen_func
+
+
 # ---------------------------------------------------------------------------
 # Rotary helpers (self-contained; avoids coupling to HF model internals)
 # ---------------------------------------------------------------------------
@@ -211,10 +234,14 @@ class PagedAttention(nn.Module):
         bm = block_manager
         block_size = bm.config.block_size
 
+        # Pull cu_seqlens to the host once; indexing a GPU tensor per element
+        # below would force a device->host sync on every access.
+        cu = cu_seqlens.tolist()
+
         # TODO: Convert to a single fused kernel to reduce kernel launch overhead. Maybe use cache_ops.reshape_and_cache
         for i, sid in enumerate(seq_ids):
-            start = int(cu_seqlens[i].item())
-            end = int(cu_seqlens[i + 1].item())
+            start = cu[i]
+            end = cu[i + 1]
             num_new = end - start
             base_pos = seq_lens_before[i]       # token position in the full sequence
 
@@ -249,7 +276,7 @@ class PagedAttention(nn.Module):
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         cu_seqlens_q: torch.Tensor,
-        cu_seqlens_k: torch.Tensor,
+        seqused_k: torch.Tensor,
         max_seqlen_q: int,
         max_seqlen_k: int,
         block_table: torch.Tensor,
@@ -257,7 +284,7 @@ class PagedAttention(nn.Module):
         """
         Combined attention for mixed prefill/decode batches.
 
-        Uses flash_attn_varlen_func with a block table to read K/V directly
+        Uses vllm_flash_attn's flash_attn_varlen_func with a block table to read K/V directly
         from the contiguous paged cache.
 
         Parameters
@@ -266,7 +293,9 @@ class PagedAttention(nn.Module):
         k_cache      : [num_blocks, block_size, num_kv_heads, head_dim]
         v_cache      : [num_blocks, block_size, num_kv_heads, head_dim]
         cu_seqlens_q : int32 tensor of cumulative query token counts (len num_seqs+1).
-        cu_seqlens_k : int32 tensor of cumulative key token counts (len num_seqs+1).
+        seqused_k    : int32 tensor of per-sequence key token counts (len num_seqs).
+                       The fork requires this instead of cu_seqlens_k when a
+                       block_table is given.
         max_seqlen_q : Maximum query sequence length in the batch.
         max_seqlen_k : Maximum key sequence length in the batch.
         block_table  : [num_seqs, max_blocks_per_seq] physical block IDs.
@@ -275,13 +304,15 @@ class PagedAttention(nn.Module):
         -------
         out : [total_tokens, num_heads, head_dim]
         """
-        from flash_attn import flash_attn_varlen_func
+        # vLLM's fork rather than upstream flash-attn: upstream requires the
+        # paged block size to be divisible by 256, the fork only requires 16.
+        flash_attn_varlen_func = load_flash_attn_varlen_func()
         return flash_attn_varlen_func(
             q,
             k_cache,
             v_cache,
             cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
+            seqused_k=seqused_k,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             causal=True,
@@ -341,14 +372,10 @@ class PagedAttention(nn.Module):
         max_seqlen_q = max(input_lens)
         max_seqlen_k = max(total_seq_lens)
 
-        # cu_seqlens_k covers the full KV lengths (cached + new)
-        cu_seqlens_k = torch.zeros(
-            len(seq_ids) + 1, device=hidden_states.device, dtype=torch.int32,
-        )
-        torch.cumsum(
-            torch.tensor(total_seq_lens, device=hidden_states.device, dtype=torch.int32),
-            dim=0,
-            out=cu_seqlens_k[1:],
+        # Per-sequence KV lengths (cached + new). The paged path takes these as
+        # seqused_k rather than cumulative cu_seqlens_k.
+        seqused_k = torch.tensor(
+            total_seq_lens, device=hidden_states.device, dtype=torch.int32,
         )
 
         # K/V are read directly from the contiguous paged cache by the kernel.
@@ -357,7 +384,7 @@ class PagedAttention(nn.Module):
         attn_out = self._attention(
             q, k_cache, v_cache,
             cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens_k,
+            seqused_k=seqused_k,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             block_table=block_table,
