@@ -4,6 +4,7 @@ from .metrics import compute_metrics, print_metrics
 from .sequence import (
     SamplingParams,
     SequenceStatus,
+    FinishReason,
     Sequence,
     SequenceIdAllocator,
     RequestQueue,
@@ -20,6 +21,7 @@ __all__ = [
     "print_metrics",
     "SamplingParams",
     "SequenceStatus",
+    "FinishReason",
     "Sequence",
     "SequenceIdAllocator",
     "RequestQueue",

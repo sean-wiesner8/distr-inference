@@ -27,7 +27,7 @@ from collections import deque
 from dataclasses import dataclass
 from enum import Enum, auto
 from itertools import count
-from typing import Deque, Iterator, List, Optional, Tuple
+from typing import Deque, FrozenSet, Iterator, List, Optional, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -45,13 +45,18 @@ class SamplingParams:
     top_k         : Restrict sampling to the ``k`` highest-probability tokens.
                     ``-1`` disables top-k filtering.
     max_tokens    : Maximum number of tokens to generate before finishing.
-    stop_token_ids: Token IDs that finish the sequence when produced
-                    (e.g. the EOS token).
+    stop_token_ids: Extra token IDs that finish the sequence when produced,
+                    on top of the engine's EOS ids.
+    ignore_eos    : Don't stop on the engine's EOS ids; only
+                    ``stop_token_ids`` and ``max_tokens`` apply. For
+                    fixed-length generation (benchmarks, teacher-forced
+                    tests).
     """
     temperature: float = 1.0
     top_k: int = -1
     max_tokens: int = 16
     stop_token_ids: Tuple[int, ...] = ()
+    ignore_eos: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +67,11 @@ class SequenceStatus(Enum):
     WAITING  = auto()   # queued, prompt not yet prefilled
     RUNNING  = auto()   # prefilled, decoding
     FINISHED = auto()   # hit max_tokens or a stop token
+
+
+class FinishReason(Enum):
+    STOP   = auto()   # produced an EOS / stop token
+    LENGTH = auto()   # reached max_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +90,8 @@ class Sequence:
     prompt_token_ids : The prompt, tokenized. Immutable after construction.
     sampling_params  : Sampling / stopping configuration.
     status           : Initial lifecycle state (defaults to ``WAITING``).
+    eos_token_ids    : The model's EOS ids. Merged into the stop set unless
+                       ``sampling_params.ignore_eos`` is set.
     """
 
     def __init__(
@@ -88,12 +100,21 @@ class Sequence:
         prompt_token_ids: List[int],
         sampling_params: SamplingParams,
         status: SequenceStatus = SequenceStatus.WAITING,
+        eos_token_ids: Tuple[int, ...] = (),
     ) -> None:
         self.seq_id = seq_id
         self.prompt_token_ids: List[int] = list(prompt_token_ids)
         self.output_token_ids: List[int] = []
         self.sampling_params = sampling_params
         self.status = status
+        self.finish_reason: Optional[FinishReason] = None
+
+        # Effective stop set: request-level stop ids plus, unless opted out,
+        # the model's EOS ids.
+        stop = set(sampling_params.stop_token_ids)
+        if not sampling_params.ignore_eos:
+            stop.update(eos_token_ids)
+        self.stop_token_ids: FrozenSet[int] = frozenset(stop)
 
         # How many of this sequence's tokens are already written to the paged
         # KV cache. Feeds the model's ``seq_lens`` ("tokens cached before this
@@ -151,8 +172,9 @@ class Sequence:
     def mark_running(self) -> None:
         self.status = SequenceStatus.RUNNING
 
-    def mark_finished(self) -> None:
+    def mark_finished(self, reason: Optional[FinishReason] = None) -> None:
         self.status = SequenceStatus.FINISHED
+        self.finish_reason = reason
 
     # ------------------------------------------------------------------
     # Mutation
@@ -163,15 +185,16 @@ class Sequence:
         Append a generated token and update the finished state.
 
         The sequence is marked ``FINISHED`` if the new token is a stop token
-        or if it brings the output up to ``max_tokens``.
+        (reason ``STOP``) or if it brings the output up to ``max_tokens``
+        (reason ``LENGTH``). The stop token itself is kept in
+        ``output_token_ids``; stripping it is a detokenization concern.
         """
         self.output_token_ids.append(token_id)
 
-        sp = self.sampling_params
-        if token_id in sp.stop_token_ids:
-            self.mark_finished()
-        elif self.num_output_tokens >= sp.max_tokens:
-            self.mark_finished()
+        if token_id in self.stop_token_ids:
+            self.mark_finished(FinishReason.STOP)
+        elif self.num_output_tokens >= self.sampling_params.max_tokens:
+            self.mark_finished(FinishReason.LENGTH)
 
     def advance_cache(self, num_tokens: int) -> None:
         """

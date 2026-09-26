@@ -10,10 +10,10 @@ hardcoded, so swapping to another Llama variant is a one-line change.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
-from transformers import AutoConfig
+from transformers import AutoConfig, GenerationConfig
 
 
 LLAMA_3_2_1B_ID = "meta-llama/Llama-3.2-1B"
@@ -85,3 +85,24 @@ class ModelConfig:
 
 def load_llama_3_2_1b_config() -> ModelConfig:
     return ModelConfig.from_hf(LLAMA_3_2_1B_ID)
+
+
+def resolve_eos_token_ids(model_id_or_path: str) -> Tuple[int, ...]:
+    """
+    The checkpoint's EOS token ids, for :class:`LLMEngine`'s default stop set.
+
+    Prefers ``generation_config.json``: Instruct checkpoints list every
+    turn-ending token there (``<|end_of_text|>``, ``<|eom_id|>``,
+    ``<|eot_id|>``) while ``config.json`` often carries only one. Falls back
+    to ``config.json`` when the checkpoint has no generation config. The field
+    may be an int or a list; always returns a tuple.
+    """
+    try:
+        eos = GenerationConfig.from_pretrained(model_id_or_path).eos_token_id
+    except OSError:
+        eos = None
+    if eos is None:
+        eos = AutoConfig.from_pretrained(model_id_or_path).eos_token_id
+    if eos is None:
+        return ()
+    return tuple(eos) if isinstance(eos, (list, tuple)) else (eos,)

@@ -50,7 +50,7 @@ if not torch.cuda.is_available():
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from distr_inference.block_manager import BlockManager
-from distr_inference.config import DEVICE, DTYPE
+from distr_inference.config import DEVICE, DTYPE, resolve_eos_token_ids
 from distr_inference.engine import LLMEngine
 from distr_inference.kv_cache import KVBlockConfig
 from distr_inference.model import LlamaModel
@@ -97,6 +97,11 @@ def tokenizer():
 
 
 @pytest.fixture(scope="module")
+def eos_token_ids():
+    return resolve_eos_token_ids(MODEL_ID)
+
+
+@pytest.fixture(scope="module")
 def model(hf_cfg):
     m = LlamaModel(hf_cfg)
     load_llama_weights(m, MODEL_ID)
@@ -117,13 +122,14 @@ def make_block_manager(hf_cfg):
     return BlockManager(num_blocks=16, config=kv_cfg)
 
 
-def make_engine(model, hf_cfg, sampler):
+def make_engine(model, hf_cfg, sampler, eos_token_ids):
     return LLMEngine.build(
         model,
         make_block_manager(hf_cfg),
         SchedulerConfig(max_num_seqs=8, max_num_batched_tokens=2048),
         device=DEVICE,
         sampler=sampler,
+        eos_token_ids=eos_token_ids,
     )
 
 
@@ -227,9 +233,11 @@ class BatchRecorder:
         return self.model(input_ids, position_ids, cu_seqlens, bm, seq_ids, seq_lens)
 
 
-def test_batched_matches_sequential(model, hf_cfg, tokenizer):
+def test_batched_matches_sequential(model, hf_cfg, tokenizer, eos_token_ids):
     prompt_ids = [encode(tokenizer, p) for p in PROMPTS]
-    sp = SamplingParams(temperature=0.0, max_tokens=MAX_TOKENS)
+    # ignore_eos: the per-step comparison needs every run to be exactly
+    # MAX_TOKENS long, even if the model emits EOS early.
+    sp = SamplingParams(temperature=0.0, max_tokens=MAX_TOKENS, ignore_eos=True)
 
     # Every prompt must fit in one block at prefill and spill into a second
     # during decode, so lazy block allocation runs mid-batch.
@@ -246,7 +254,7 @@ def test_batched_matches_sequential(model, hf_cfg, tokenizer):
             logs.append(logits.float().cpu())
             return int(logits.argmax())
 
-        engine = make_engine(model, hf_cfg, greedy_recording)
+        engine = make_engine(model, hf_cfg, greedy_recording, eos_token_ids)
         engine.add_request(ids, sp)
         with torch.no_grad():
             finished = engine.run_to_completion()
@@ -263,7 +271,7 @@ def test_batched_matches_sequential(model, hf_cfg, tokenizer):
         return alone_tokens[i][seq.num_output_tokens]
 
     recorder = BatchRecorder(model)
-    engine = make_engine(recorder, hf_cfg, forced_recording)
+    engine = make_engine(recorder, hf_cfg, forced_recording, eos_token_ids)
     pending = dict(ADMIT_STEP)
     step = 0
     with torch.no_grad():
@@ -302,3 +310,14 @@ def test_batched_matches_sequential(model, hf_cfg, tokenizer):
         f"batched vs alone logit drift {worst:.4f} exceeds {BATCH_TOL}; "
         f"per-step max drift:\n{profile}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 3. EOS resolution from the real checkpoint
+# ---------------------------------------------------------------------------
+
+def test_resolve_eos_token_ids_matches_tokenizer(eos_token_ids, tokenizer):
+    # Llama-3.2-1B base: <|end_of_text|> = 128001. Checked against the
+    # tokenizer rather than hardcoded so DISTR_INFERENCE_MODEL_ID overrides work.
+    assert eos_token_ids, "checkpoint declares no EOS token"
+    assert tokenizer.eos_token_id in eos_token_ids

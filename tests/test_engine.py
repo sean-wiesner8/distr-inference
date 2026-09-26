@@ -12,7 +12,7 @@ from distr_inference.block_manager import BlockManager
 from distr_inference.engine import LLMEngine
 from distr_inference.kv_cache import KVBlockConfig
 from distr_inference.scheduler import SchedulerConfig
-from distr_inference.sequence import SamplingParams
+from distr_inference.sequence import FinishReason, SamplingParams
 
 
 VOCAB = 16
@@ -50,7 +50,7 @@ class StubModel:
         return logits
 
 
-def make_engine(num_blocks=64, max_num_seqs=8, max_num_batched_tokens=1024):
+def make_engine(num_blocks=64, max_num_seqs=8, max_num_batched_tokens=1024, eos_token_ids=()):
     bm = BlockManager(num_blocks=num_blocks, config=CONFIG)
     model = StubModel()
     engine = LLMEngine.build(
@@ -61,6 +61,7 @@ def make_engine(num_blocks=64, max_num_seqs=8, max_num_batched_tokens=1024):
             max_num_batched_tokens=max_num_batched_tokens,
         ),
         device="cpu",
+        eos_token_ids=eos_token_ids,
     )
     return engine, model, bm
 
@@ -166,6 +167,43 @@ def test_custom_sampler_overrides_sampling():
     assert finished[0].output_token_ids == forced
     assert seen_rows == [torch.Size([VOCAB])] * 3      # one logits row per step
     assert [c["input_ids"] for c in model.calls[1:]] == [[3], [9]]
+
+
+# ---------------------------------------------------------------------------
+# EOS handling
+# ---------------------------------------------------------------------------
+
+def test_engine_eos_stops_request_early():
+    # The stub always argmaxes to PEAK_TOKEN; make that the model's EOS.
+    engine, _, bm = make_engine(eos_token_ids=(PEAK_TOKEN,))
+    engine.add_request([1, 2, 3], greedy(max_tokens=10))
+
+    finished = engine.run_to_completion()
+
+    seq = finished[0]
+    assert seq.output_token_ids == [PEAK_TOKEN]
+    assert seq.finish_reason == FinishReason.STOP
+    assert bm.num_used_blocks == 0                     # freed on EOS, not at max_tokens
+
+
+def test_ignore_eos_runs_to_max_tokens():
+    engine, _, _ = make_engine(eos_token_ids=(PEAK_TOKEN,))
+    engine.add_request([1, 2, 3], greedy(max_tokens=4, ignore_eos=True))
+
+    seq = engine.run_to_completion()[0]
+
+    assert seq.output_token_ids == [PEAK_TOKEN] * 4
+    assert seq.finish_reason == FinishReason.LENGTH
+
+
+def test_request_stop_ids_add_to_engine_eos():
+    engine, _, _ = make_engine(eos_token_ids=(0,))
+    engine.add_request([1, 2, 3], greedy(max_tokens=10, stop_token_ids=(PEAK_TOKEN,)))
+
+    seq = engine.run_to_completion()[0]
+
+    assert seq.stop_token_ids == {0, PEAK_TOKEN}       # merged, not replaced
+    assert seq.finish_reason == FinishReason.STOP
 
 
 def test_finished_sequences_free_blocks_for_waiting():
