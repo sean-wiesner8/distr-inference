@@ -17,7 +17,7 @@ model (no CUDA / flash-attn) as well as with the real paged-attention model.
 
 from __future__ import annotations
 
-from typing import Callable, List, Tuple
+from typing import Callable, Iterable, List, Tuple
 
 import torch
 
@@ -61,6 +61,10 @@ class LLMEngine:
     device        : Device for the packed input tensors (must match the model).
     sampler       : Token picker; defaults to :func:`default_sampler`. Tests
                     override it to record logits or force a token path.
+    eos_token_ids : The model's EOS ids (see
+                    :func:`~distr_inference.config.resolve_eos_token_ids`).
+                    Every request stops on these unless it sets
+                    ``SamplingParams.ignore_eos``.
     """
 
     def __init__(
@@ -70,12 +74,14 @@ class LLMEngine:
         scheduler: Scheduler,
         device: torch.device | str = "cuda",
         sampler: SamplerFn = default_sampler,
+        eos_token_ids: Iterable[int] = (),
     ) -> None:
         self.model = model
         self.block_manager = block_manager
         self.scheduler = scheduler
         self.device = torch.device(device)
         self.sampler = sampler
+        self.eos_token_ids: Tuple[int, ...] = tuple(eos_token_ids)
         self._ids = SequenceIdAllocator()
 
     # ------------------------------------------------------------------
@@ -90,10 +96,11 @@ class LLMEngine:
         scheduler_config: SchedulerConfig,
         device: torch.device | str = "cuda",
         sampler: SamplerFn = default_sampler,
+        eos_token_ids: Iterable[int] = (),
     ) -> "LLMEngine":
         """Convenience constructor that wires up the scheduler."""
         scheduler = Scheduler(block_manager, scheduler_config)
-        return cls(model, block_manager, scheduler, device, sampler)
+        return cls(model, block_manager, scheduler, device, sampler, eos_token_ids)
 
     # ------------------------------------------------------------------
     # Submission
@@ -108,7 +115,10 @@ class LLMEngine:
         Submit a prompt for generation. Returns the assigned sequence id.
         """
         seq_id = self._ids.next_id()
-        seq = Sequence(seq_id, prompt_token_ids, sampling_params)
+        seq = Sequence(
+            seq_id, prompt_token_ids, sampling_params,
+            eos_token_ids=self.eos_token_ids,
+        )
         self.scheduler.add_request(seq)
         return seq_id
 

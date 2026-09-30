@@ -3,6 +3,7 @@
 import pytest
 
 from distr_inference.sequence import (
+    FinishReason,
     SamplingParams,
     Sequence,
     SequenceStatus,
@@ -11,11 +12,12 @@ from distr_inference.sequence import (
 )
 
 
-def make_seq(seq_id: int = 0, prompt=(1, 2, 3), **sp_kwargs) -> Sequence:
+def make_seq(seq_id: int = 0, prompt=(1, 2, 3), eos_token_ids=(), **sp_kwargs) -> Sequence:
     return Sequence(
         seq_id=seq_id,
         prompt_token_ids=list(prompt),
         sampling_params=SamplingParams(**sp_kwargs),
+        eos_token_ids=eos_token_ids,
     )
 
 
@@ -66,14 +68,48 @@ def test_finishes_at_max_tokens():
     seq.append_token(101)
     assert seq.done
     assert seq.status == SequenceStatus.FINISHED
+    assert seq.finish_reason == FinishReason.LENGTH
 
 
 def test_finishes_on_stop_token():
     seq = make_seq(max_tokens=100, stop_token_ids=(42,))
     seq.append_token(10)
     assert not seq.done
+    assert seq.finish_reason is None
     seq.append_token(42)
     assert seq.done
+    assert seq.finish_reason == FinishReason.STOP
+    assert seq.output_token_ids == [10, 42]      # stop token is kept
+
+
+def test_finishes_on_eos_token():
+    seq = make_seq(max_tokens=100, eos_token_ids=(99,))
+    seq.append_token(10)
+    assert not seq.done
+    seq.append_token(99)
+    assert seq.done
+    assert seq.finish_reason == FinishReason.STOP
+
+
+def test_eos_merges_with_request_stop_ids():
+    seq = make_seq(eos_token_ids=(99,), stop_token_ids=(42,))
+    assert seq.stop_token_ids == {42, 99}
+
+
+def test_ignore_eos_keeps_request_stop_ids():
+    seq = make_seq(max_tokens=3, eos_token_ids=(99,), stop_token_ids=(42,), ignore_eos=True)
+    assert seq.stop_token_ids == {42}
+    seq.append_token(99)                          # EOS ignored
+    assert not seq.done
+    seq.append_token(42)                          # explicit stop still applies
+    assert seq.finish_reason == FinishReason.STOP
+
+
+def test_stop_token_on_last_allowed_step_reports_stop():
+    # A stop token that also reaches max_tokens is a STOP, not a LENGTH.
+    seq = make_seq(max_tokens=1, eos_token_ids=(99,))
+    seq.append_token(99)
+    assert seq.finish_reason == FinishReason.STOP
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +122,7 @@ def test_mark_running_and_finished():
     assert seq.status == SequenceStatus.RUNNING
     seq.mark_finished()
     assert seq.done
+    assert seq.finish_reason is None              # external finish, no reason given
 
 
 # ---------------------------------------------------------------------------
