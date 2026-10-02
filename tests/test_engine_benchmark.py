@@ -2,11 +2,21 @@
 End-to-end engine benchmark on the real paged-attention model.
 
 Measures the continuous-batching LLMEngine over Llama-3.2-1B (or an override
-via DISTR_INFERENCE_MODEL_ID) in two configurations:
+via DISTR_INFERENCE_MODEL_ID) in three configurations:
 
   1. Single request — one prompt generated alone; the latency baseline.
   2. Batched — BATCH_SIZE prompts submitted together and decoded in the same
      forward passes.
+  3. Long prompt — one LONG_PROMPT_TOKENS-token prompt generated alone. The
+     short prompts above are ~8 tokens, so prefill cost (per-token KV writes,
+     lm_head over every prompt position) is invisible in them; this run's
+     TTFT is where prefill-side work shows up, and its ITL is decode against
+     a long context.
+
+Every configuration is warmed up once before it is timed. With CUDA lazy
+module loading, a kernel is loaded on its first use in the process, and each
+batch shape can pick different kernels — warming up only one shape leaves the
+others paying that load inside the timed run.
 
 For each run we report per-request TTFT / ITL (via ``compute_metrics``),
 aggregate throughput, and peak GPU memory. Run with ``-s`` to see the table.
@@ -21,7 +31,8 @@ specific latency targets: every request must produce its full MAX_TOKENS, and
 batching must raise throughput by at least MIN_BATCH_SPEEDUP over the single
 request. Decode on a 1B model is memory-bound, so a working batched path
 scales close to linearly; falling under the floor means batching has
-regressed into something close to serial execution.
+regressed into something close to serial execution. The long-prompt run is
+reported but not asserted on.
 
 Requires CUDA + HF auth for the model, and vLLM's paged flash-attn kernel.
 Skipped otherwise.
@@ -71,9 +82,14 @@ PROMPTS = [
 ]
 BATCH_SIZE = len(PROMPTS)
 MAX_TOKENS = 64
+LONG_PROMPT_TOKENS = 2000
 BLOCK_SIZE = 16
-# 8 requests x ceil((~10 prompt + 64 output) / 16) = 5 blocks each, plus slack.
-NUM_BLOCKS = 64
+# Sized for the largest run: the long prompt needs
+# ceil((2000 + 64) / 16) = 130 blocks; 8 short requests need ~40.
+NUM_BLOCKS = 256
+# Above LONG_PROMPT_TOKENS so the long prefill fits the step budget normally
+# rather than through the scheduler's oversized-prompt escape hatch.
+MAX_NUM_BATCHED_TOKENS = 4096
 
 # Batched throughput must be at least this multiple of single-request
 # throughput. Well under the near-linear scaling expected at batch 8, so it
@@ -116,6 +132,21 @@ def encode(tokenizer, prompt):
     return tokenizer(prompt, return_tensors="pt").input_ids[0].tolist()
 
 
+def long_prompt_ids(tokenizer, n_tokens):
+    """Exactly ``n_tokens`` ids: the short prompts repeated, then truncated.
+
+    The content is irrelevant (generation ignores EOS and runs a fixed
+    length); only the length matters. Truncating the encoded ids rather than
+    the text pins the length exactly and keeps the leading BOS.
+    """
+    text = " ".join(PROMPTS)
+    ids = encode(tokenizer, text)
+    while len(ids) < n_tokens:
+        text = text + " " + text
+        ids = encode(tokenizer, text)
+    return ids[:n_tokens]
+
+
 # ---------------------------------------------------------------------------
 # Timed run
 # ---------------------------------------------------------------------------
@@ -137,7 +168,9 @@ def run_timed(model, hf_cfg, prompt_ids):
     engine = LLMEngine.build(
         model,
         make_block_manager(hf_cfg),
-        SchedulerConfig(max_num_seqs=BATCH_SIZE, max_num_batched_tokens=2048),
+        SchedulerConfig(
+            max_num_seqs=BATCH_SIZE, max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
+        ),
         device=DEVICE,
         sampler=recording_sampler,
     )
@@ -187,12 +220,13 @@ def run_timed(model, hf_cfg, prompt_ids):
     return per_request, aggregate
 
 
-def format_report(name, per_request, aggregate):
+def format_report(name, per_request, aggregate, prompt_tokens):
     ttft = [m["ttft_ms"] for m in per_request]
     itl = [m["itl_mean_ms"] for m in per_request]
     p99 = [m["itl_p99_ms"] for m in per_request]
     return "\n".join([
-        f"{name} ({len(per_request)} request(s) x {MAX_TOKENS} tokens)",
+        f"{name} ({len(per_request)} request(s), prompts <= {prompt_tokens} tokens, "
+        f"{MAX_TOKENS} output tokens each)",
         f"  TTFT mean / max:      {sum(ttft) / len(ttft):8.2f} / {max(ttft):8.2f} ms",
         f"  ITL mean / worst p99: {sum(itl) / len(itl):8.2f} / {max(p99):8.2f} ms",
         f"  Throughput:           {aggregate['throughput_tokens_per_sec']:8.1f} tokens/s",
@@ -208,21 +242,31 @@ def format_report(name, per_request, aggregate):
 
 def test_engine_benchmark(model, hf_cfg, tokenizer):
     prompt_ids = [encode(tokenizer, p) for p in PROMPTS]
+    configs = {
+        "single": prompt_ids[:1],
+        "batched": prompt_ids,
+        "long prompt": [long_prompt_ids(tokenizer, LONG_PROMPT_TOKENS)],
+    }
 
-    # Warm-up: first-call CUDA context setup, cuBLAS heuristics, and kernel
-    # loading would otherwise land in the single-request TTFT.
-    run_timed(model, hf_cfg, prompt_ids)
+    # Warm up every configuration before timing any of them: CUDA context
+    # setup, cuBLAS heuristics, and lazy kernel loading are per batch shape
+    # and would otherwise land inside the timed runs.
+    for ids in configs.values():
+        run_timed(model, hf_cfg, ids)
 
-    single, single_agg = run_timed(model, hf_cfg, prompt_ids[:1])
-    batched, batched_agg = run_timed(model, hf_cfg, prompt_ids)
+    results = {name: run_timed(model, hf_cfg, ids) for name, ids in configs.items()}
 
+    single_agg = results["single"][1]
+    batched_agg = results["batched"][1]
     speedup = batched_agg["throughput_tokens_per_sec"] / single_agg["throughput_tokens_per_sec"]
-    report = "\n".join([
-        "",
-        format_report("single", single, single_agg),
-        format_report("batched", batched, batched_agg),
-        f"batched / single throughput: {speedup:.2f}x",
-    ])
+    report = "\n".join(
+        [""]
+        + [
+            format_report(name, per_request, agg, max(map(len, configs[name])))
+            for name, (per_request, agg) in results.items()
+        ]
+        + [f"batched / single throughput: {speedup:.2f}x"]
+    )
     print(report)  # visible with -s
 
     assert speedup >= MIN_BATCH_SPEEDUP, (
