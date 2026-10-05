@@ -58,6 +58,10 @@ PROMPTS = [
 ]
 BLOCK_SIZE = 16
 WARMUP = 10
+# record_function label around each profiled step. The profiler also records
+# it on the GPU timeline as a span covering the whole step, so it must be
+# excluded when summing kernel time.
+STEP_LABEL = "decode_step"
 
 # Host-side profiler events that mean "the CPU waited on the GPU" or "data
 # crossed the PCIe bus". Names are CUDA runtime/driver API calls.
@@ -124,7 +128,10 @@ def device_time_us(evt):
 def summarize(prof, steps, wall_ms_per_step):
     events = prof.key_averages()
 
-    gpu_us = sum(device_time_us(e) for e in events if e.device_type == DeviceType.CUDA)
+    gpu_us = sum(
+        device_time_us(e) for e in events
+        if e.device_type == DeviceType.CUDA and e.key != STEP_LABEL
+    )
     launches = sum(e.count for e in events if "LaunchKernel" in e.key)
     syncs = sum(e.count for e in events if e.key in SYNC_EVENTS)
     copies = sum(e.count for e in events if e.key in COPY_EVENTS)
@@ -181,7 +188,7 @@ def main():
             with_stack=args.stack,
         ) as prof:
             for _ in range(args.steps):
-                with record_function("decode_step"):
+                with record_function(STEP_LABEL):
                     engine.step()
             torch.cuda.synchronize()
 
