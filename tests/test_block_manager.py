@@ -108,6 +108,48 @@ def test_allocate_block_raises_when_pool_exhausted():
 
 
 # ---------------------------------------------------------------------------
+# ensure_capacity
+# ---------------------------------------------------------------------------
+
+def test_ensure_capacity_allocates_ceil_blocks():
+    manager = make_manager()
+    manager.register_sequence(seq_id=0)
+    assert manager.ensure_capacity(seq_id=0, num_tokens=5) == 2   # block_size=4
+    assert manager.num_blocks_for_sequence(seq_id=0) == 2
+
+
+def test_ensure_capacity_is_idempotent():
+    manager = make_manager()
+    manager.register_sequence(seq_id=0)
+    manager.ensure_capacity(seq_id=0, num_tokens=5)
+    assert manager.ensure_capacity(seq_id=0, num_tokens=8) == 0   # still 2 blocks
+    assert manager.ensure_capacity(seq_id=0, num_tokens=9) == 1
+    assert manager.num_blocks_for_sequence(seq_id=0) == 3
+
+
+def test_ensure_capacity_zero_tokens_allocates_nothing():
+    manager = make_manager()
+    manager.register_sequence(seq_id=0)
+    assert manager.ensure_capacity(seq_id=0, num_tokens=0) == 0
+    assert manager.num_free_blocks == 8
+
+
+def test_ensure_capacity_is_all_or_nothing():
+    manager = make_manager(num_blocks=2)
+    manager.register_sequence(seq_id=0)
+    with pytest.raises(RuntimeError):
+        manager.ensure_capacity(seq_id=0, num_tokens=9)   # needs 3
+    assert manager.num_blocks_for_sequence(seq_id=0) == 0
+    assert manager.num_free_blocks == 2
+
+
+def test_ensure_capacity_unregistered_raises():
+    manager = make_manager()
+    with pytest.raises(KeyError):
+        manager.ensure_capacity(seq_id=99, num_tokens=1)
+
+
+# ---------------------------------------------------------------------------
 # get_block_table
 # ---------------------------------------------------------------------------
 
@@ -119,6 +161,14 @@ def test_get_block_table_reflects_allocations():
     table = manager.get_block_table(seq_id=0)
     assert len(table) == 2
     assert set(table.keys()) == {0, 1}
+
+
+def test_get_block_ids_in_logical_order():
+    manager = make_manager()
+    manager.register_sequence(seq_id=0)
+    manager.ensure_capacity(seq_id=0, num_tokens=12)
+    table = manager.get_block_table(seq_id=0)
+    assert manager.get_block_ids(seq_id=0) == [table[i] for i in range(3)]
 
 
 def test_get_block_table_is_a_copy():
@@ -162,26 +212,3 @@ def test_write_slot_and_read_back():
     assert torch.allclose(k_layer[physical_id, 0], k)
     assert torch.allclose(v_layer[physical_id, 0], v)
 
-
-def test_num_filled_tracking():
-    manager = make_manager(num_blocks=4)
-    manager.register_sequence(seq_id=0)
-    manager.allocate_block(seq_id=0)
-
-    physical_id = manager.get_block_table(seq_id=0)[0]
-    assert manager.get_num_filled(physical_id) == 0
-
-    manager.set_num_filled(physical_id, 3)
-    assert manager.get_num_filled(physical_id) == 3
-
-
-def test_free_sequence_resets_num_filled():
-    manager = make_manager(num_blocks=4)
-    manager.register_sequence(seq_id=0)
-    manager.allocate_block(seq_id=0)
-
-    physical_id = manager.get_block_table(seq_id=0)[0]
-    manager.set_num_filled(physical_id, 2)
-
-    manager.free_sequence(seq_id=0)
-    assert manager.get_num_filled(physical_id) == 0

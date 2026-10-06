@@ -230,6 +230,9 @@ class PagedAttention(nn.Module):
         seq_lens_before: Number of tokens already in the cache *before* this
                          step, per sequence. Used to compute the correct
                          block/slot offsets for writes.
+
+        Every sequence's blocks must already be allocated (the scheduler does
+        this before the forward pass); this method never allocates.
         """
         bm = block_manager
         block_size = bm.config.block_size
@@ -244,17 +247,14 @@ class PagedAttention(nn.Module):
             end = cu[i + 1]
             num_new = end - start
             base_pos = seq_lens_before[i]       # token position in the full sequence
+            block_ids = bm.get_block_ids(sid)
 
             for t in range(num_new):
                 abs_pos = base_pos + t
                 logical_idx = abs_pos // block_size
                 slot_idx = abs_pos % block_size
 
-                # Allocate a new block when we step into an unallocated logical index.
-                if slot_idx == 0 and bm.num_blocks_for_sequence(sid) <= logical_idx:
-                    bm.allocate_block(sid)
-
-                physical_id = bm.get_block_table(sid)[logical_idx]
+                physical_id = block_ids[logical_idx]
                 bm.write_slot(
                     physical_block_id=physical_id,
                     slot_idx=slot_idx,
@@ -262,9 +262,6 @@ class PagedAttention(nn.Module):
                     k=k[start + t],
                     v=v[start + t],
                 )
-                # Update filled count so reads reflect written slots.
-                if bm.get_num_filled(physical_id) <= slot_idx:
-                    bm.set_num_filled(physical_id, slot_idx + 1)
 
     # ------------------------------------------------------------------
     # Attention

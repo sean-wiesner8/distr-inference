@@ -46,8 +46,9 @@ def test_admits_waiting_and_registers_blocks():
     assert batch[0].status == SequenceStatus.RUNNING
     assert sched.running == batch
     assert not sched.waiting
-    # Sequence must be registered so the forward pass can allocate its blocks.
-    assert bm.num_blocks_for_sequence(0) == 0  # lazily grown during forward, not here
+    # Blocks are allocated by the scheduler, before the forward pass:
+    # 3 tokens at block_size=4 → 1 block.
+    assert bm.num_blocks_for_sequence(0) == 1
 
 
 def test_admission_is_fifo():
@@ -116,7 +117,6 @@ def test_running_and_waiting_batched_together():
     s0 = sched.running[0]
     s0.advance_cache(4)          # prefill wrote 4 tokens
     s0.append_token(99)          # decoded one token, now uncached
-    bm.allocate_block(0)         # its prefill block (mirrors forward-time alloc)
 
     # New request arrives; next schedule must batch decode(seq0) + prefill(seq1).
     sched.add_request(seq(1, prompt_len=3))
@@ -125,6 +125,29 @@ def test_running_and_waiting_batched_together():
     assert [s.seq_id for s in batch] == [0, 1]  # running first, then admitted
     assert batch[0].num_uncached_tokens == 1    # decode
     assert batch[1].num_uncached_tokens == 3    # prefill
+    # Seq 0 is now 5 tokens → crossed into a 2nd block; seq 1 fits in 1.
+    assert bm.num_blocks_for_sequence(0) == 2
+    assert bm.num_blocks_for_sequence(1) == 1
+
+
+def test_decode_allocates_only_on_block_boundary():
+    sched, bm = make_scheduler()
+    sched.add_request(seq(0, prompt_len=3))
+    sched.schedule()
+    s0 = sched.running[0]
+    assert bm.num_blocks_for_sequence(0) == 1
+
+    # Token 4 still fits in block 0.
+    s0.advance_cache(3)
+    s0.append_token(1)
+    sched.schedule()
+    assert bm.num_blocks_for_sequence(0) == 1
+
+    # Token 5 needs block 1.
+    s0.advance_cache(1)
+    s0.append_token(2)
+    sched.schedule()
+    assert bm.num_blocks_for_sequence(0) == 2
 
 
 def test_running_decode_out_of_blocks_raises():
@@ -133,8 +156,7 @@ def test_running_decode_out_of_blocks_raises():
     sched.add_request(seq(0, prompt_len=4))
     sched.schedule()
     s0 = sched.running[0]
-    s0.advance_cache(4)
-    bm.allocate_block(0)          # consumes the only block (now full at 4 slots)
+    s0.advance_cache(4)           # prefill filled the only block (4 slots)
     s0.append_token(50)           # crosses into a 2nd block on next step
     assert bm.num_free_blocks == 0
     with pytest.raises(RuntimeError, match="preemption is not implemented"):
@@ -152,7 +174,6 @@ def test_free_finished_evicts_and_releases_blocks():
     sched.schedule()
     for s in sched.running:
         s.advance_cache(4)
-        bm.allocate_block(s.seq_id)
 
     used_before = bm.num_used_blocks
     sched.running[0].append_token(7)   # seq 0 hits max_tokens=1 → finished

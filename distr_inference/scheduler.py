@@ -7,10 +7,11 @@ FIFO while they fit a per-step token budget, a max-sequences cap, and the KV
 block budget. After the forward pass and sampling, :meth:`free_finished`
 evicts finished sequences and releases their KV blocks back to the pool.
 
-Block allocation itself is *not* reimplemented here — the paged-attention
-forward lazily calls :meth:`BlockManager.allocate_block` as tokens cross block
-boundaries. The scheduler only *reserves against* the free-block count so it
-never admits work the cache can't hold.
+The scheduler also allocates every KV block a step needs, before the forward
+pass runs: each batched sequence's block table is grown to cover its full
+``seq_len`` via :meth:`BlockManager.ensure_capacity`. The forward pass only
+writes into blocks that already exist, so the block tables are final by the
+time the engine packs its inputs.
 
 Out of scope (clean seams left, not implemented)
 ------------------------------------------------
@@ -88,8 +89,7 @@ class Scheduler:
 
         A step processes ``seq`` up to its current ``seq_len``; the cache must
         cover ``ceil(seq_len / block_size)`` blocks in total. The delta over
-        what's already allocated is what this step will lazily allocate during
-        the forward pass.
+        what's already allocated is what :meth:`schedule` allocates for it.
         """
         block_size = self.block_manager.config.block_size
         target_blocks = (seq.seq_len + block_size - 1) // block_size
@@ -104,17 +104,18 @@ class Scheduler:
         Select the sequences to run this step (mixed prefill + decode).
 
         Returns them in batch order — the order the engine must use to pack
-        ``input_ids`` / ``cu_seqlens`` / ``seq_ids`` / ``seq_lens``.
+        ``input_ids`` / ``cu_seqlens`` / ``seq_ids`` / ``seq_lens``. Every
+        returned sequence has enough KV blocks allocated to hold ``seq_len``
+        tokens.
         """
+        bm = self.block_manager
         batch: List[Sequence] = []
         token_budget = self.config.max_num_batched_tokens
-        free_blocks = self.block_manager.num_free_blocks
 
         # --- Phase 1: running sequences decode. Decode has priority for blocks. ---
         for seq in self.running:
-            need = self._blocks_to_add(
-                seq, self.block_manager.num_blocks_for_sequence(seq.seq_id)
-            )
+            need = self._blocks_to_add(seq, bm.num_blocks_for_sequence(seq.seq_id))
+            free_blocks = bm.num_free_blocks
             if need > free_blocks:
                 # Preemption/eviction is out of scope: there is nothing we are
                 # allowed to reclaim. Fail loudly rather than corrupt the cache.
@@ -123,7 +124,7 @@ class Scheduler:
                     f"decode (need {need}, free {free_blocks}); preemption is "
                     f"not implemented."
                 )
-            free_blocks -= need
+            bm.ensure_capacity(seq.seq_id, seq.seq_len)
             token_budget -= seq.num_uncached_tokens
             batch.append(seq)
 
@@ -139,6 +140,7 @@ class Scheduler:
             if batch and n_tokens > token_budget:
                 break
 
+            free_blocks = bm.num_free_blocks
             if need > free_blocks:
                 if not batch:
                     # Nothing running to free blocks later and it still won't
@@ -151,11 +153,11 @@ class Scheduler:
                 break
 
             self.waiting.pop()
-            self.block_manager.register_sequence(seq.seq_id)
+            bm.register_sequence(seq.seq_id)
+            bm.ensure_capacity(seq.seq_id, seq.seq_len)
             seq.mark_running()
             self.running.append(seq)
 
-            free_blocks -= need
             token_budget -= n_tokens
             batch.append(seq)
 

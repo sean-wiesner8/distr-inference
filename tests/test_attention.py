@@ -84,8 +84,6 @@ def _register_and_prefill(bm: BlockManager, seq_id: int, num_tokens: int, layer_
         k = torch.randn(NUM_KV_HEADS, HEAD_DIM)
         v = torch.randn(NUM_KV_HEADS, HEAD_DIM)
         bm.write_slot(physical_id, slot_idx, layer_idx, k, v)
-        if bm.get_num_filled(physical_id) <= slot_idx:
-            bm.set_num_filled(physical_id, slot_idx + 1)
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +163,7 @@ def test_write_kv_prefill_single_seq():
     attn = make_paged_attention(layer_idx=0)
     bm = make_manager()
     bm.register_sequence(0)
+    bm.ensure_capacity(0, 6)
 
     num_tokens = 6
     k = torch.randn(num_tokens, NUM_KV_HEADS, HEAD_DIM)
@@ -173,13 +172,8 @@ def test_write_kv_prefill_single_seq():
 
     attn._write_kv_to_paged_cache(k, v, cu_seqlens, bm, seq_ids=[0], seq_lens_before=[0])
 
-    # 2 blocks allocated: first full (4), second partial (2).
-    assert bm.num_blocks_for_sequence(0) == 2
+    # Verify values in cache: first block full (4), second partial (2).
     table = bm.get_block_table(0)
-    assert bm.get_num_filled(table[0]) == BLOCK_SIZE
-    assert bm.get_num_filled(table[1]) == 2
-
-    # Verify values in cache.
     k_cache, v_cache = bm.get_kv_cache(layer_idx=0)
     for t in range(num_tokens):
         logical_idx = t // BLOCK_SIZE
@@ -201,10 +195,9 @@ def test_write_kv_single_token_decode():
 
     attn._write_kv_to_paged_cache(k_new, v_new, cu_seqlens, bm, seq_ids=[0], seq_lens_before=[3])
 
-    # Still 1 block, now with 4 filled slots.
+    # Still 1 block; the new token lands in its last slot.
     table = bm.get_block_table(0)
     assert bm.num_blocks_for_sequence(0) == 1
-    assert bm.get_num_filled(table[0]) == 4
 
     k_cache, v_cache = bm.get_kv_cache(layer_idx=0)
     pid = table[0]
@@ -213,12 +206,11 @@ def test_write_kv_single_token_decode():
 
 
 def test_write_kv_decode_crosses_block_boundary():
-    """Decode with full first block → new block allocated."""
+    """Decode with full first block → token lands in slot 0 of the second block."""
     attn = make_paged_attention(layer_idx=0)
     bm = make_manager()
     _register_and_prefill(bm, seq_id=0, num_tokens=4, layer_idx=0)
-
-    assert bm.num_blocks_for_sequence(0) == 1
+    bm.ensure_capacity(0, 5)
 
     k_new = torch.randn(1, NUM_KV_HEADS, HEAD_DIM)
     v_new = torch.randn(1, NUM_KV_HEADS, HEAD_DIM)
@@ -228,7 +220,6 @@ def test_write_kv_decode_crosses_block_boundary():
 
     assert bm.num_blocks_for_sequence(0) == 2
     table = bm.get_block_table(0)
-    assert bm.get_num_filled(table[1]) == 1
 
     k_cache, v_cache = bm.get_kv_cache(layer_idx=0)
     pid = table[1]
@@ -243,6 +234,7 @@ def test_write_kv_mixed_batch():
 
     # Seq 0: fresh prefill.
     bm.register_sequence(0)
+    bm.ensure_capacity(0, 3)
     # Seq 1: already has 5 tokens (2 blocks: one full, one with 1 slot).
     _register_and_prefill(bm, seq_id=1, num_tokens=5, layer_idx=0)
 
@@ -256,15 +248,20 @@ def test_write_kv_mixed_batch():
         seq_lens_before=[0, 5],
     )
 
-    # Seq 0: 1 block with 3 filled.
+    k_cache, v_cache = bm.get_kv_cache(layer_idx=0)
+
+    # Seq 0: tokens 0-2 in slots 0-2 of its only block.
     table0 = bm.get_block_table(0)
     assert bm.num_blocks_for_sequence(0) == 1
-    assert bm.get_num_filled(table0[0]) == 3
+    for t in range(3):
+        assert torch.allclose(k_cache[table0[0], t], k[t])
+        assert torch.allclose(v_cache[table0[0], t], v[t])
 
-    # Seq 1: still 2 blocks, second block now has 2 filled.
+    # Seq 1: still 2 blocks; its new token (position 5) is slot 1 of block 1.
     table1 = bm.get_block_table(1)
     assert bm.num_blocks_for_sequence(1) == 2
-    assert bm.get_num_filled(table1[1]) == 2
+    assert torch.allclose(k_cache[table1[1], 1], k[3])
+    assert torch.allclose(v_cache[table1[1], 1], v[3])
 
 
 def test_write_kv_spans_multiple_blocks():
@@ -272,6 +269,7 @@ def test_write_kv_spans_multiple_blocks():
     attn = make_paged_attention(layer_idx=0)
     bm = make_manager()
     bm.register_sequence(0)
+    bm.ensure_capacity(0, 9)
 
     num_tokens = 9
     k = torch.randn(num_tokens, NUM_KV_HEADS, HEAD_DIM)
@@ -282,9 +280,26 @@ def test_write_kv_spans_multiple_blocks():
 
     assert bm.num_blocks_for_sequence(0) == 3
     table = bm.get_block_table(0)
-    assert bm.get_num_filled(table[0]) == BLOCK_SIZE
-    assert bm.get_num_filled(table[1]) == BLOCK_SIZE
-    assert bm.get_num_filled(table[2]) == 1
+    k_cache, v_cache = bm.get_kv_cache(layer_idx=0)
+    for t in range(num_tokens):
+        pid = table[t // BLOCK_SIZE]
+        assert torch.allclose(k_cache[pid, t % BLOCK_SIZE], k[t])
+        assert torch.allclose(v_cache[pid, t % BLOCK_SIZE], v[t])
+
+
+def test_write_kv_does_not_allocate():
+    """Allocation is the scheduler's job; writing past the block table must fail."""
+    attn = make_paged_attention(layer_idx=0)
+    bm = make_manager()
+    bm.register_sequence(0)
+
+    k = torch.randn(1, NUM_KV_HEADS, HEAD_DIM)
+    v = torch.randn(1, NUM_KV_HEADS, HEAD_DIM)
+    cu_seqlens = torch.tensor([0, 1], dtype=torch.int32)
+
+    with pytest.raises(IndexError):
+        attn._write_kv_to_paged_cache(k, v, cu_seqlens, bm, seq_ids=[0], seq_lens_before=[0])
+    assert bm.num_blocks_for_sequence(0) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -365,6 +380,7 @@ def test_forward_output_shape_prefill():
     attn = make_paged_attention()
     bm = make_manager()
     bm.register_sequence(0)
+    bm.ensure_capacity(0, 6)
 
     num_tokens = 6
     hidden = torch.randn(num_tokens, HIDDEN_SIZE)
@@ -394,6 +410,7 @@ def test_forward_writes_to_cache():
     attn = make_paged_attention(layer_idx=0)
     bm = make_manager()
     bm.register_sequence(0)
+    bm.ensure_capacity(0, 3)
 
     num_tokens = 3
     hidden = torch.randn(num_tokens, HIDDEN_SIZE)
@@ -417,6 +434,7 @@ def test_forward_mixed_batch():
 
     # Seq 0: fresh prefill of 4 tokens.
     bm.register_sequence(0)
+    bm.ensure_capacity(0, 4)
     # Seq 1: decode 1 token, already has 3 cached.
     _register_and_prefill(bm, seq_id=1, num_tokens=3, layer_idx=0)
 
@@ -432,12 +450,13 @@ def test_forward_mixed_batch():
     )
 
     assert out.shape == (total_tokens, HIDDEN_SIZE)
-    # Seq 0 should now have 1 block with 4 filled.
+    k_cache, _ = bm.get_kv_cache(layer_idx=0)
+    # Seq 0: 1 block, last prefill token written to slot 3.
     assert bm.num_blocks_for_sequence(0) == 1
-    assert bm.get_num_filled(bm.get_block_table(0)[0]) == BLOCK_SIZE
-    # Seq 1 should still have 1 block, now with 4 filled.
+    assert not torch.all(k_cache[bm.get_block_table(0)[0], 3] == 0)
+    # Seq 1: still 1 block, decode token written to slot 3.
     assert bm.num_blocks_for_sequence(1) == 1
-    assert bm.get_num_filled(bm.get_block_table(1)[0]) == BLOCK_SIZE
+    assert not torch.all(k_cache[bm.get_block_table(1)[0], 3] == 0)
 
 
 # ---------------------------------------------------------------------------
@@ -474,6 +493,7 @@ def test_attention_output_shape_gpu():
     ).cuda()
 
     bm.register_sequence(0)
+    bm.ensure_capacity(0, 6)
 
     num_tokens = 6
     hidden = torch.randn(num_tokens, HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
@@ -502,6 +522,7 @@ def test_forward_end_to_end_gpu():
 
     # Prefill seq 0 with 4 tokens.
     bm.register_sequence(0)
+    bm.ensure_capacity(0, 4)
     hidden_pf = torch.randn(4, HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
     pos_pf = torch.arange(4, device="cuda")
     cu_pf = torch.tensor([0, 4], dtype=torch.int32, device="cuda")
@@ -509,6 +530,7 @@ def test_forward_end_to_end_gpu():
     assert out_pf.shape == (4, HIDDEN_SIZE)
 
     # Decode 1 new token.
+    bm.ensure_capacity(0, 5)
     hidden_dec = torch.randn(1, HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
     pos_dec = torch.tensor([4], device="cuda")
     cu_dec = torch.tensor([0, 1], dtype=torch.int32, device="cuda")

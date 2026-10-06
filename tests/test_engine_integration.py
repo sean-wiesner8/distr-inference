@@ -173,6 +173,7 @@ def test_decode_logits_match_hf_reference(model, hf_cfg, tokenizer):
     # back the KV written by earlier steps at ever-larger position offsets.
     bm = make_block_manager(hf_cfg)
     bm.register_sequence(0)
+    bm.ensure_capacity(0, T)
 
     our_step_logits = []
     with torch.no_grad():
@@ -189,6 +190,7 @@ def test_decode_logits_match_hf_reference(model, hf_cfg, tokenizer):
             input_ids = torch.tensor([ref_tokens[k]], dtype=torch.int64, device=DEVICE)
             position_ids = torch.tensor([pos], dtype=torch.int32, device=DEVICE)
             cu = torch.tensor([0, 1], dtype=torch.int32, device=DEVICE)
+            bm.ensure_capacity(0, pos + 1)
             our_step_logits.append(model(input_ids, position_ids, cu, bm, [0], [pos])[-1])
 
     # Per-step comparison. Because both models are on the same sequence, any

@@ -26,7 +26,7 @@ Block table    : Per-sequence dict[int, int]  (logical_idx → physical_block_id
 from __future__ import annotations
 
 from collections import deque
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 
@@ -62,7 +62,6 @@ class BlockManager:
 
         # Per-block metadata
         self._block_states: list[BlockState] = [BlockState.FREE] * num_blocks
-        self._num_filled: list[int] = [0] * num_blocks
 
         # Free pool — deque for O(1) pop/append
         self._free_pool: deque[int] = deque(range(num_blocks))
@@ -115,7 +114,6 @@ class BlockManager:
 
         for physical_id in self._block_tables[seq_id].values():
             self._block_states[physical_id] = BlockState.FREE
-            self._num_filled[physical_id] = 0
             self._free_pool.append(physical_id)
 
         del self._block_tables[seq_id]
@@ -153,6 +151,37 @@ class BlockManager:
         self._block_tables[seq_id][logical_idx] = physical_id
         return logical_idx
 
+    def ensure_capacity(self, seq_id: int, num_tokens: int) -> int:
+        """
+        Grow a sequence's block table until it can hold ``num_tokens`` tokens.
+
+        All-or-nothing: if the pool can't cover the shortfall, nothing is
+        allocated.
+
+        Returns
+        -------
+        The number of blocks newly allocated (0 if already large enough).
+
+        Raises
+        ------
+        KeyError    if seq_id is not registered.
+        RuntimeError if the free pool can't cover the shortfall.
+        """
+        if seq_id not in self._block_tables:
+            raise KeyError(f"Sequence {seq_id} is not registered.")
+
+        block_size = self.config.block_size
+        target = (num_tokens + block_size - 1) // block_size
+        need = max(0, target - len(self._block_tables[seq_id]))
+        if need > len(self._free_pool):
+            raise RuntimeError(
+                f"Out of physical KV cache blocks (sequence {seq_id} needs "
+                f"{need}, {len(self._free_pool)} free)."
+            )
+        for _ in range(need):
+            self.allocate_block(seq_id)
+        return need
+
     # ------------------------------------------------------------------
     # Block table access
     # ------------------------------------------------------------------
@@ -168,6 +197,16 @@ class BlockManager:
         if seq_id not in self._block_tables:
             raise KeyError(f"Sequence {seq_id} is not registered.")
         return dict(self._block_tables[seq_id])
+
+    def get_block_ids(self, seq_id: int) -> List[int]:
+        """
+        Return a sequence's physical block IDs in logical order.
+
+        Blocks are only ever appended, so list position == logical index.
+        """
+        if seq_id not in self._block_tables:
+            raise KeyError(f"Sequence {seq_id} is not registered.")
+        return list(self._block_tables[seq_id].values())
 
     def num_blocks_for_sequence(self, seq_id: int) -> int:
         """Return how many physical blocks are currently allocated to seq_id."""
@@ -210,14 +249,6 @@ class BlockManager:
         """
         self.k_cache[layer_idx, physical_block_id, slot_idx] = k
         self.v_cache[layer_idx, physical_block_id, slot_idx] = v
-
-    def get_num_filled(self, physical_block_id: int) -> int:
-        """Return how many slots have been written in a block."""
-        return self._num_filled[physical_block_id]
-
-    def set_num_filled(self, physical_block_id: int, count: int) -> None:
-        """Update the filled-slot count for a block."""
-        self._num_filled[physical_block_id] = count
 
     # ------------------------------------------------------------------
     # Dunder helpers

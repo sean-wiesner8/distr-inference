@@ -68,6 +68,7 @@ def test_prefill_matches_hf_reference():
     cu_seqlens   = torch.tensor([0, T], dtype=torch.int32, device=DEVICE)    # [2]
 
     bm.register_sequence(0)
+    bm.ensure_capacity(0, T)
     with torch.no_grad():
         our_logits = model(input_ids, position_ids, cu_seqlens, bm, [0], [0])  # [T, V]
 
