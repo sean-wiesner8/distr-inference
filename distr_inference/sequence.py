@@ -160,6 +160,19 @@ class Sequence:
         """Tokens not yet written to the KV cache (what the next step must process)."""
         return self.seq_len - self.num_cached_tokens
 
+    @property
+    def uncached_token_ids(self) -> List[int]:
+        """
+        ``all_token_ids[num_cached_tokens:]`` without materializing the full
+        sequence: slices only the list(s) the uncached suffix falls in. On a
+        decode step that's a one-element slice of ``output_token_ids``.
+        """
+        start = self.num_cached_tokens
+        num_prompt = len(self.prompt_token_ids)
+        if start >= num_prompt:
+            return self.output_token_ids[start - num_prompt:]
+        return self.prompt_token_ids[start:] + self.output_token_ids
+
     # ------------------------------------------------------------------
     # Status helpers
     # ------------------------------------------------------------------

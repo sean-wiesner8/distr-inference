@@ -148,6 +148,22 @@ def test_advance_cache_past_seq_len_raises():
         seq.advance_cache(4)
 
 
+def test_uncached_token_ids_matches_all_token_ids_suffix():
+    seq = make_seq(prompt=(1, 2, 3), max_tokens=10)
+    seq.append_token(7)
+    seq.append_token(8)
+    for cached in range(seq.seq_len + 1):
+        seq.num_cached_tokens = cached
+        assert seq.uncached_token_ids == seq.all_token_ids[cached:]
+
+
+def test_uncached_token_ids_on_decode_is_last_token():
+    seq = make_seq(prompt=(1, 2, 3), max_tokens=10)
+    seq.advance_cache(3)
+    seq.append_token(7)
+    assert seq.uncached_token_ids == [7]
+
+
 # ---------------------------------------------------------------------------
 # SequenceIdAllocator
 # ---------------------------------------------------------------------------
