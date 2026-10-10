@@ -5,8 +5,10 @@ import torch
 import torch.nn as nn
 
 from distr_inference.attention import PagedAttention, _rotate_half
+from distr_inference.attention_metadata import build_step_inputs
 from distr_inference.block_manager import BlockManager
 from distr_inference.kv_cache import KVBlockConfig
+from distr_inference.sequence import SamplingParams, Sequence
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +86,22 @@ def _register_and_prefill(bm: BlockManager, seq_id: int, num_tokens: int, layer_
         k = torch.randn(NUM_KV_HEADS, HEAD_DIM)
         v = torch.randn(NUM_KV_HEADS, HEAD_DIM)
         bm.write_slot(physical_id, slot_idx, layer_idx, k, v)
+
+
+def make_metadata(bm: BlockManager, specs, device="cpu"):
+    """
+    Build ``(position_ids, attn_metadata)`` for a batch via the real builder.
+
+    ``specs`` is one ``(seq_id, num_cached, num_new)`` per sequence, in batch
+    order. Each sequence's blocks must already cover ``num_cached + num_new``.
+    """
+    batch = []
+    for seq_id, num_cached, num_new in specs:
+        seq = Sequence(seq_id, [0] * (num_cached + num_new), SamplingParams())
+        seq.num_cached_tokens = num_cached
+        batch.append(seq)
+    _, position_ids, md = build_step_inputs(batch, bm, device)
+    return position_ids, md
 
 
 # ---------------------------------------------------------------------------
@@ -168,9 +186,9 @@ def test_write_kv_prefill_single_seq():
     num_tokens = 6
     k = torch.randn(num_tokens, NUM_KV_HEADS, HEAD_DIM)
     v = torch.randn(num_tokens, NUM_KV_HEADS, HEAD_DIM)
-    cu_seqlens = torch.tensor([0, num_tokens], dtype=torch.int32)
+    cu_seqlens = [0, num_tokens]
 
-    attn._write_kv_to_paged_cache(k, v, cu_seqlens, bm, seq_ids=[0], seq_lens_before=[0])
+    attn._write_kv_to_paged_cache(k, v, cu_seqlens, bm, seq_ids=[0], num_cached=[0])
 
     # Verify values in cache: first block full (4), second partial (2).
     table = bm.get_block_table(0)
@@ -191,9 +209,9 @@ def test_write_kv_single_token_decode():
 
     k_new = torch.randn(1, NUM_KV_HEADS, HEAD_DIM)
     v_new = torch.randn(1, NUM_KV_HEADS, HEAD_DIM)
-    cu_seqlens = torch.tensor([0, 1], dtype=torch.int32)
+    cu_seqlens = [0, 1]
 
-    attn._write_kv_to_paged_cache(k_new, v_new, cu_seqlens, bm, seq_ids=[0], seq_lens_before=[3])
+    attn._write_kv_to_paged_cache(k_new, v_new, cu_seqlens, bm, seq_ids=[0], num_cached=[3])
 
     # Still 1 block; the new token lands in its last slot.
     table = bm.get_block_table(0)
@@ -214,9 +232,9 @@ def test_write_kv_decode_crosses_block_boundary():
 
     k_new = torch.randn(1, NUM_KV_HEADS, HEAD_DIM)
     v_new = torch.randn(1, NUM_KV_HEADS, HEAD_DIM)
-    cu_seqlens = torch.tensor([0, 1], dtype=torch.int32)
+    cu_seqlens = [0, 1]
 
-    attn._write_kv_to_paged_cache(k_new, v_new, cu_seqlens, bm, seq_ids=[0], seq_lens_before=[4])
+    attn._write_kv_to_paged_cache(k_new, v_new, cu_seqlens, bm, seq_ids=[0], num_cached=[4])
 
     assert bm.num_blocks_for_sequence(0) == 2
     table = bm.get_block_table(0)
@@ -240,12 +258,12 @@ def test_write_kv_mixed_batch():
 
     k = torch.randn(4, NUM_KV_HEADS, HEAD_DIM)  # 3 + 1 tokens
     v = torch.randn(4, NUM_KV_HEADS, HEAD_DIM)
-    cu_seqlens = torch.tensor([0, 3, 4], dtype=torch.int32)
+    cu_seqlens = [0, 3, 4]
 
     attn._write_kv_to_paged_cache(
         k, v, cu_seqlens, bm,
         seq_ids=[0, 1],
-        seq_lens_before=[0, 5],
+        num_cached=[0, 5],
     )
 
     k_cache, v_cache = bm.get_kv_cache(layer_idx=0)
@@ -274,9 +292,9 @@ def test_write_kv_spans_multiple_blocks():
     num_tokens = 9
     k = torch.randn(num_tokens, NUM_KV_HEADS, HEAD_DIM)
     v = torch.randn(num_tokens, NUM_KV_HEADS, HEAD_DIM)
-    cu_seqlens = torch.tensor([0, num_tokens], dtype=torch.int32)
+    cu_seqlens = [0, num_tokens]
 
-    attn._write_kv_to_paged_cache(k, v, cu_seqlens, bm, seq_ids=[0], seq_lens_before=[0])
+    attn._write_kv_to_paged_cache(k, v, cu_seqlens, bm, seq_ids=[0], num_cached=[0])
 
     assert bm.num_blocks_for_sequence(0) == 3
     table = bm.get_block_table(0)
@@ -295,10 +313,10 @@ def test_write_kv_does_not_allocate():
 
     k = torch.randn(1, NUM_KV_HEADS, HEAD_DIM)
     v = torch.randn(1, NUM_KV_HEADS, HEAD_DIM)
-    cu_seqlens = torch.tensor([0, 1], dtype=torch.int32)
+    cu_seqlens = [0, 1]
 
     with pytest.raises(IndexError):
-        attn._write_kv_to_paged_cache(k, v, cu_seqlens, bm, seq_ids=[0], seq_lens_before=[0])
+        attn._write_kv_to_paged_cache(k, v, cu_seqlens, bm, seq_ids=[0], num_cached=[0])
     assert bm.num_blocks_for_sequence(0) == 0
 
 
@@ -361,17 +379,20 @@ def test_build_block_table_dtype_and_device():
 # Group 6: forward with mocked attention (CPU, no flash-attn needed)
 # ---------------------------------------------------------------------------
 
-def _mock_flash_attn(q, k, v, **kwargs):
-    """Mock that returns zeros shaped like q."""
-    return torch.zeros_like(q)
+def _run_forward_mocked(attn, hidden_states, position_ids, md, bm, captured=None):
+    """
+    Run forward with _attention monkey-patched to avoid flash-attn. If
+    ``captured`` is a dict, the kwargs passed to _attention are stored in it.
+    """
+    def fake_attention(q, k_cache, v_cache, **kw):
+        if captured is not None:
+            captured.update(kw)
+        return torch.zeros_like(q)
 
-
-def _run_forward_mocked(attn, hidden_states, position_ids, cu_seqlens, bm, seq_ids, seq_lens):
-    """Run forward with _attention monkey-patched to avoid flash-attn."""
     original = attn._attention
-    attn._attention = lambda q, k_cache, v_cache, **kw: torch.zeros_like(q)
+    attn._attention = fake_attention
     try:
-        return attn(hidden_states, position_ids, cu_seqlens, bm, seq_ids, seq_lens)
+        return attn(hidden_states, position_ids, md, bm)
     finally:
         attn._attention = original
 
@@ -384,10 +405,9 @@ def test_forward_output_shape_prefill():
 
     num_tokens = 6
     hidden = torch.randn(num_tokens, HIDDEN_SIZE)
-    pos = torch.arange(num_tokens)
-    cu_seqlens = torch.tensor([0, num_tokens], dtype=torch.int32)
+    pos, md = make_metadata(bm, [(0, 0, num_tokens)])
 
-    out = _run_forward_mocked(attn, hidden, pos, cu_seqlens, bm, seq_ids=[0], seq_lens=[0])
+    out = _run_forward_mocked(attn, hidden, pos, md, bm)
 
     assert out.shape == (num_tokens, HIDDEN_SIZE)
 
@@ -396,12 +416,12 @@ def test_forward_output_shape_decode():
     attn = make_paged_attention()
     bm = make_manager()
     _register_and_prefill(bm, seq_id=0, num_tokens=5, layer_idx=0)
+    bm.ensure_capacity(0, 6)
 
     hidden = torch.randn(1, HIDDEN_SIZE)
-    pos = torch.tensor([5])
-    cu_seqlens = torch.tensor([0, 1], dtype=torch.int32)
+    pos, md = make_metadata(bm, [(0, 5, 1)])
 
-    out = _run_forward_mocked(attn, hidden, pos, cu_seqlens, bm, seq_ids=[0], seq_lens=[5])
+    out = _run_forward_mocked(attn, hidden, pos, md, bm)
 
     assert out.shape == (1, HIDDEN_SIZE)
 
@@ -414,10 +434,9 @@ def test_forward_writes_to_cache():
 
     num_tokens = 3
     hidden = torch.randn(num_tokens, HIDDEN_SIZE)
-    pos = torch.arange(num_tokens)
-    cu_seqlens = torch.tensor([0, num_tokens], dtype=torch.int32)
+    pos, md = make_metadata(bm, [(0, 0, num_tokens)])
 
-    _run_forward_mocked(attn, hidden, pos, cu_seqlens, bm, seq_ids=[0], seq_lens=[0])
+    _run_forward_mocked(attn, hidden, pos, md, bm)
 
     # Cache should have been written to (non-zero values from projections).
     k_cache, v_cache = bm.get_kv_cache(layer_idx=0)
@@ -440,14 +459,10 @@ def test_forward_mixed_batch():
 
     total_tokens = 5  # 4 + 1
     hidden = torch.randn(total_tokens, HIDDEN_SIZE)
-    pos = torch.cat([torch.arange(4), torch.tensor([3])])
-    cu_seqlens = torch.tensor([0, 4, 5], dtype=torch.int32)
+    pos, md = make_metadata(bm, [(0, 0, 4), (1, 3, 1)])
+    assert pos.tolist() == [0, 1, 2, 3, 3]
 
-    out = _run_forward_mocked(
-        attn, hidden, pos, cu_seqlens, bm,
-        seq_ids=[0, 1],
-        seq_lens=[0, 3],
-    )
+    out = _run_forward_mocked(attn, hidden, pos, md, bm)
 
     assert out.shape == (total_tokens, HIDDEN_SIZE)
     k_cache, _ = bm.get_kv_cache(layer_idx=0)
@@ -457,6 +472,27 @@ def test_forward_mixed_batch():
     # Seq 1: still 1 block, decode token written to slot 3.
     assert bm.num_blocks_for_sequence(1) == 1
     assert not torch.all(k_cache[bm.get_block_table(1)[0], 3] == 0)
+
+
+def test_forward_passes_metadata_through_unchanged():
+    """Attention consumes the per-step metadata as-is; nothing is rebuilt per layer."""
+    attn = make_paged_attention(layer_idx=0)
+    bm = make_manager()
+    bm.register_sequence(0)
+    bm.ensure_capacity(0, 4)
+    _register_and_prefill(bm, seq_id=1, num_tokens=3, layer_idx=0)
+
+    hidden = torch.randn(5, HIDDEN_SIZE)
+    pos, md = make_metadata(bm, [(0, 0, 4), (1, 3, 1)])
+
+    captured = {}
+    _run_forward_mocked(attn, hidden, pos, md, bm, captured=captured)
+
+    assert captured["cu_seqlens_q"] is md.cu_seqlens_q
+    assert captured["seqused_k"] is md.seqused_k
+    assert captured["block_table"] is md.block_table
+    assert captured["max_seqlen_q"] == md.max_seqlen_q
+    assert captured["max_seqlen_k"] == md.max_seqlen_k
 
 
 # ---------------------------------------------------------------------------
@@ -497,10 +533,9 @@ def test_attention_output_shape_gpu():
 
     num_tokens = 6
     hidden = torch.randn(num_tokens, HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
-    pos = torch.arange(num_tokens, device="cuda")
-    cu_seqlens = torch.tensor([0, num_tokens], dtype=torch.int32, device="cuda")
+    pos, md = make_metadata(bm, [(0, 0, num_tokens)], device="cuda")
 
-    out = attn(hidden, pos, cu_seqlens, bm, seq_ids=[0], seq_lens=[0])
+    out = attn(hidden, pos, md, bm)
 
     assert out.shape == (num_tokens, HIDDEN_SIZE)
     assert torch.isfinite(out).all()
@@ -524,16 +559,14 @@ def test_forward_end_to_end_gpu():
     bm.register_sequence(0)
     bm.ensure_capacity(0, 4)
     hidden_pf = torch.randn(4, HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
-    pos_pf = torch.arange(4, device="cuda")
-    cu_pf = torch.tensor([0, 4], dtype=torch.int32, device="cuda")
-    out_pf = attn(hidden_pf, pos_pf, cu_pf, bm, seq_ids=[0], seq_lens=[0])
+    pos_pf, md_pf = make_metadata(bm, [(0, 0, 4)], device="cuda")
+    out_pf = attn(hidden_pf, pos_pf, md_pf, bm)
     assert out_pf.shape == (4, HIDDEN_SIZE)
 
     # Decode 1 new token.
     bm.ensure_capacity(0, 5)
     hidden_dec = torch.randn(1, HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
-    pos_dec = torch.tensor([4], device="cuda")
-    cu_dec = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
-    out_dec = attn(hidden_dec, pos_dec, cu_dec, bm, seq_ids=[0], seq_lens=[4])
+    pos_dec, md_dec = make_metadata(bm, [(0, 4, 1)], device="cuda")
+    out_dec = attn(hidden_dec, pos_dec, md_dec, bm)
     assert out_dec.shape == (1, HIDDEN_SIZE)
     assert torch.isfinite(out_dec).all()

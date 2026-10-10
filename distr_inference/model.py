@@ -10,12 +10,11 @@ config requests it (true for Llama-3.2-1B).
 
 from __future__ import annotations
 
-from typing import List
-
 import torch
 import torch.nn as nn
 from transformers import LlamaConfig
 
+from .attention_metadata import AttentionMetadata
 from .block_manager import BlockManager
 from .decoder_layer import LlamaDecoderLayer
 from .rms_norm import LlamaRMSNorm
@@ -28,7 +27,7 @@ class LlamaModel(nn.Module):
 
     Takes a packed batch (mixed prefill/decode) and returns logits for every
     token in that buffer. The scheduler is responsible for slicing the last
-    position of each segment using ``cu_seqlens`` when sampling; doing it
+    position of each segment using ``cu_seqlens_q`` when sampling; doing it
     here would force a branch between prefill and decode that the packed
     layout exists to avoid.
 
@@ -59,10 +58,8 @@ class LlamaModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
-        cu_seqlens: torch.Tensor,
+        attn_metadata: AttentionMetadata,
         block_manager: BlockManager,
-        seq_ids: List[int],
-        seq_lens: List[int],
     ) -> torch.Tensor:
         """
         Forward pass on a packed 1-D token buffer.
@@ -75,10 +72,11 @@ class LlamaModel(nn.Module):
         -------
         logits : [total_tokens, vocab_size]
             Logits for every packed token. The scheduler slices the last
-            position of each segment (``cu_seqlens[i+1] - 1``) when sampling.
+            position of each segment (``cu_seqlens_q[i+1] - 1``) when sampling.
 
         See ``PagedAttention.forward`` for the meaning of ``position_ids``,
-        ``cu_seqlens``, ``seq_ids``, and ``seq_lens``.
+        ``attn_metadata``, and ``block_manager``. ``attn_metadata`` is built
+        once per step and shared by every layer.
         """
         hidden_states = self.embed_tokens(input_ids)
 
@@ -86,10 +84,8 @@ class LlamaModel(nn.Module):
             hidden_states = layer(
                 hidden_states,
                 position_ids,
-                cu_seqlens,
+                attn_metadata,
                 block_manager,
-                seq_ids,
-                seq_lens,
             )
 
         hidden_states = self.norm(hidden_states)

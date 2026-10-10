@@ -34,14 +34,14 @@ class StubModel:
     def __init__(self):
         self.calls = []
 
-    def __call__(self, input_ids, position_ids, cu_seqlens, bm, seq_ids, seq_lens):
+    def __call__(self, input_ids, position_ids, md, bm):
         self.calls.append(
             {
                 "input_ids": input_ids.tolist(),
                 "position_ids": position_ids.tolist(),
-                "cu_seqlens": cu_seqlens.tolist(),
-                "seq_ids": list(seq_ids),
-                "seq_lens": list(seq_lens),
+                "cu_seqlens": list(md.cu_seqlens_cpu),
+                "seq_ids": list(md.seq_ids),
+                "seq_lens": list(md.num_cached),
             }
         )
         total_tokens = input_ids.shape[0]

@@ -30,10 +30,12 @@ if not torch.cuda.is_available():
 
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
+from distr_inference.attention_metadata import build_step_inputs
 from distr_inference.block_manager import BlockManager
 from distr_inference.config import DEVICE, DTYPE
 from distr_inference.kv_cache import KVBlockConfig
 from distr_inference.model import LlamaModel
+from distr_inference.sequence import SamplingParams, Sequence
 from distr_inference.weight_loader import load_llama_weights
 
 
@@ -63,14 +65,13 @@ def test_prefill_matches_hf_reference():
     ids_2d = tokenizer(PROMPT, return_tensors="pt").input_ids.to(DEVICE)  # [1, T]
     T = ids_2d.shape[1]
 
-    input_ids   = ids_2d[0]                                                  # [T]
-    position_ids = torch.arange(T, device=DEVICE, dtype=torch.int32)         # [T]
-    cu_seqlens   = torch.tensor([0, T], dtype=torch.int32, device=DEVICE)    # [2]
-
+    seq = Sequence(0, ids_2d[0].tolist(), SamplingParams())
     bm.register_sequence(0)
     bm.ensure_capacity(0, T)
+    input_ids, position_ids, md = build_step_inputs([seq], bm, DEVICE)       # [T], [T]
+
     with torch.no_grad():
-        our_logits = model(input_ids, position_ids, cu_seqlens, bm, [0], [0])  # [T, V]
+        our_logits = model(input_ids, position_ids, md, bm)                   # [T, V]
 
     hf = AutoModelForCausalLM.from_pretrained(
         MODEL_ID, torch_dtype=DTYPE, attn_implementation="eager",

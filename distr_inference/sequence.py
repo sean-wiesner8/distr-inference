@@ -5,9 +5,9 @@ A :class:`Sequence` is the engine's unit of work: it owns the per-request
 state that must survive *across* forward passes — the prompt, the tokens
 generated so far, the sampling parameters, and how much of the sequence is
 already resident in the paged KV cache. The model and attention layers operate
-on anonymous packed buffers (``input_ids``, ``cu_seqlens``, ``seq_ids``,
-``seq_lens``); ``Sequence`` is where that per-request state lives between the
-scheduler's iterations.
+on anonymous packed buffers (``input_ids``, ``position_ids``) and per-step
+attention metadata; ``Sequence`` is where that per-request state lives between
+the scheduler's iterations.
 
 Lifecycle
 ---------
@@ -86,7 +86,7 @@ class Sequence:
     ----------
     seq_id           : Unique integer id. Keys this sequence's block table in
                        the :class:`~distr_inference.block_manager.BlockManager`
-                       and identifies it in the model's packed ``seq_ids``.
+                       and identifies it in the attention metadata's ``seq_ids``.
     prompt_token_ids : The prompt, tokenized. Immutable after construction.
     sampling_params  : Sampling / stopping configuration.
     status           : Initial lifecycle state (defaults to ``WAITING``).
@@ -117,8 +117,8 @@ class Sequence:
         self.stop_token_ids: FrozenSet[int] = frozenset(stop)
 
         # How many of this sequence's tokens are already written to the paged
-        # KV cache. Feeds the model's ``seq_lens`` ("tokens cached before this
-        # step"). 0 until prefill runs; advanced by the scheduler after each
+        # KV cache. Feeds the attention metadata's ``num_cached`` ("tokens
+        # cached before this step"). 0 until prefill runs; advanced by the scheduler after each
         # forward pass.
         self.num_cached_tokens: int = 0
 

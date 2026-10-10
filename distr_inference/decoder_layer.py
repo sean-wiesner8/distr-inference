@@ -5,19 +5,18 @@ Pre-norm layout: ``input_layernorm`` → ``self_attn`` → residual →
 ``post_attention_layernorm`` → ``mlp`` → residual.
 
 Operates on packed ``[total_tokens, hidden]`` buffers and threads the
-paged-attention metadata (``cu_seqlens``, ``seq_ids``, ``seq_lens``,
-``block_manager``) straight through to :class:`PagedAttention`.
+per-step ``attn_metadata`` and ``block_manager`` straight through to
+:class:`PagedAttention`.
 """
 
 from __future__ import annotations
-
-from typing import List
 
 import torch
 import torch.nn as nn
 from transformers import LlamaConfig
 
 from .attention import PagedAttention
+from .attention_metadata import AttentionMetadata
 from .block_manager import BlockManager
 from .mlp import LlamaMLP
 from .rms_norm import LlamaRMSNorm
@@ -76,10 +75,8 @@ class LlamaDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
-        cu_seqlens: torch.Tensor,
+        attn_metadata: AttentionMetadata,
         block_manager: BlockManager,
-        seq_ids: List[int],
-        seq_lens: List[int],
     ) -> torch.Tensor:
         """
         Forward pass on a packed 1-D token buffer.
@@ -93,17 +90,15 @@ class LlamaDecoderLayer(nn.Module):
         out : [total_tokens, hidden]
 
         See ``PagedAttention.forward`` for the meaning of ``position_ids``,
-        ``cu_seqlens``, ``seq_ids``, and ``seq_lens``.
+        ``attn_metadata``, and ``block_manager``.
         """
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
             hidden_states,
             position_ids,
-            cu_seqlens,
+            attn_metadata,
             block_manager,
-            seq_ids,
-            seq_lens,
         )
         hidden_states = residual + hidden_states
 

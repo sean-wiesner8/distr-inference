@@ -49,13 +49,14 @@ if not torch.cuda.is_available():
 
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
+from distr_inference.attention_metadata import build_step_inputs
 from distr_inference.block_manager import BlockManager
 from distr_inference.config import DEVICE, DTYPE, resolve_eos_token_ids
 from distr_inference.engine import LLMEngine
 from distr_inference.kv_cache import KVBlockConfig
 from distr_inference.model import LlamaModel
 from distr_inference.scheduler import SchedulerConfig
-from distr_inference.sequence import SamplingParams
+from distr_inference.sequence import SamplingParams, Sequence
 from distr_inference.weight_loader import load_llama_weights
 
 
@@ -82,7 +83,7 @@ LOGIT_TOL = 3e-1
 # similar size for large and small logits — and the max over the 128k vocab
 # lands around 0.1-0.13 in practice. Same noise class as the ours-vs-HF kernel
 # drift, so it shares that budget. A real batching bug (cross-sequence KV
-# reads, wrong positions / seq_lens) drifts by whole logits.
+# reads, wrong positions / num_cached) drifts by whole logits.
 BATCH_TOL = LOGIT_TOL
 
 
@@ -172,26 +173,27 @@ def test_decode_logits_match_hf_reference(model, hf_cfg, tokenizer):
     # a packed prefill, then num_steps-1 single-token decode steps that read
     # back the KV written by earlier steps at ever-larger position offsets.
     bm = make_block_manager(hf_cfg)
+    seq = Sequence(0, prompt_ids, SamplingParams(max_tokens=num_steps, ignore_eos=True))
     bm.register_sequence(0)
-    bm.ensure_capacity(0, T)
+
+    def forward_uncached():
+        """Run the model over seq's uncached tokens, then mark them cached."""
+        bm.ensure_capacity(0, seq.seq_len)
+        input_ids, position_ids, md = build_step_inputs([seq], bm, DEVICE)
+        logits = model(input_ids, position_ids, md, bm)
+        seq.advance_cache(seq.num_uncached_tokens)
+        return logits[-1]
 
     our_step_logits = []
     with torch.no_grad():
         # Prefill over the prompt → prediction for the first generated token.
-        input_ids = torch.tensor(prompt_ids, dtype=torch.int64, device=DEVICE)
-        position_ids = torch.arange(T, dtype=torch.int32, device=DEVICE)
-        cu = torch.tensor([0, T], dtype=torch.int32, device=DEVICE)
-        our_step_logits.append(model(input_ids, position_ids, cu, bm, [0], [0])[-1])
+        our_step_logits.append(forward_uncached())
 
-        # Decode steps: feed each reference token at its absolute position; the
-        # KV it writes is read back by every later step.
+        # Decode steps: feed each reference token at its absolute position
+        # (T + k); the KV it writes is read back by every later step.
         for k in range(num_steps - 1):
-            pos = T + k  # absolute position of ref_tokens[k], and #tokens cached
-            input_ids = torch.tensor([ref_tokens[k]], dtype=torch.int64, device=DEVICE)
-            position_ids = torch.tensor([pos], dtype=torch.int32, device=DEVICE)
-            cu = torch.tensor([0, 1], dtype=torch.int32, device=DEVICE)
-            bm.ensure_capacity(0, pos + 1)
-            our_step_logits.append(model(input_ids, position_ids, cu, bm, [0], [pos])[-1])
+            seq.append_token(ref_tokens[k])
+            our_step_logits.append(forward_uncached())
 
     # Per-step comparison. Because both models are on the same sequence, any
     # difference is per-step bf16 kernel drift, not accumulated divergence.
@@ -224,15 +226,15 @@ ADMIT_STEP = {0: 0, 1: 2, 2: 5}
 
 
 class BatchRecorder:
-    """Wraps the model to record each forward pass's ``seq_lens``."""
+    """Wraps the model to record each forward pass's ``num_cached``."""
 
     def __init__(self, model):
         self.model = model
-        self.seq_lens_per_step = []
+        self.num_cached_per_step = []
 
-    def __call__(self, input_ids, position_ids, cu_seqlens, bm, seq_ids, seq_lens):
-        self.seq_lens_per_step.append(list(seq_lens))
-        return self.model(input_ids, position_ids, cu_seqlens, bm, seq_ids, seq_lens)
+    def __call__(self, input_ids, position_ids, md, bm):
+        self.num_cached_per_step.append(list(md.num_cached))
+        return self.model(input_ids, position_ids, md, bm)
 
 
 def test_batched_matches_sequential(model, hf_cfg, tokenizer, eos_token_ids):
@@ -286,10 +288,10 @@ def test_batched_matches_sequential(model, hf_cfg, tokenizer, eos_token_ids):
 
     # The stagger must have produced at least one mixed prefill+decode batch.
     mixed = [
-        lens for lens in recorder.seq_lens_per_step
+        lens for lens in recorder.num_cached_per_step
         if any(n == 0 for n in lens) and any(n > 0 for n in lens)
     ]
-    assert mixed, f"no mixed prefill/decode batch: {recorder.seq_lens_per_step}"
+    assert mixed, f"no mixed prefill/decode batch: {recorder.num_cached_per_step}"
 
     # --- Per-step logits must agree up to bf16 batch-variance noise. ---
     # Collect every step's drift before asserting, so a failure shows the whole

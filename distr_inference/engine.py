@@ -4,7 +4,7 @@ Continuous-batching engine loop.
 Drives sequences from submission to completion. Each :meth:`LLMEngine.step`:
 
     1. asks the :class:`Scheduler` for one mixed prefill/decode batch,
-    2. packs it into the model's 1-D buffers,
+    2. packs it into the model's 1-D buffers and attention metadata,
     3. runs a single forward pass,
     4. samples one token per sequence, advancing the KV-cache watermark and
        appending to each sequence, and
@@ -21,6 +21,7 @@ from typing import Callable, Iterable, List, Tuple
 
 import torch
 
+from .attention_metadata import AttentionMetadata, build_step_inputs
 from .block_manager import BlockManager
 from .sampler import sample_token
 from .scheduler import Scheduler, SchedulerConfig
@@ -32,10 +33,10 @@ from .sequence import (
 
 
 # The model is any callable matching LlamaModel.forward:
-#   (input_ids, position_ids, cu_seqlens, block_manager, seq_ids, seq_lens)
+#   (input_ids, position_ids, attn_metadata, block_manager)
 #   -> logits [total_tokens, vocab_size]
 ModelFn = Callable[
-    [torch.Tensor, torch.Tensor, torch.Tensor, BlockManager, List[int], List[int]],
+    [torch.Tensor, torch.Tensor, AttentionMetadata, BlockManager],
     torch.Tensor,
 ]
 
@@ -126,49 +127,6 @@ class LLMEngine:
         return self.scheduler.has_unfinished()
 
     # ------------------------------------------------------------------
-    # Input packing
-    # ------------------------------------------------------------------
-
-    def _build_inputs(
-        self, batch: List[Sequence]
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int], List[int]]:
-        """
-        Pack a scheduled batch into the model's 1-D buffers.
-
-        Each sequence contributes its *uncached* tokens
-        (``all_token_ids[num_cached_tokens:]``) — the whole prompt on prefill,
-        a single token on decode — at absolute positions
-        ``[num_cached_tokens, seq_len)``.
-
-        Returns
-        -------
-        input_ids   : [total_tokens]   int64
-        position_ids: [total_tokens]   int32
-        cu_seqlens  : [num_seqs + 1]   int32
-        seq_ids     : per-sequence ids, batch order
-        seq_lens    : tokens cached *before* this step, per sequence
-        """
-        flat_tokens: List[int] = []
-        flat_positions: List[int] = []
-        cu: List[int] = [0]
-        seq_ids: List[int] = []
-        seq_lens: List[int] = []
-
-        for seq in batch:
-            start = seq.num_cached_tokens
-            new_tokens = seq.all_token_ids[start:]
-            flat_tokens.extend(new_tokens)
-            flat_positions.extend(range(start, seq.seq_len))
-            cu.append(cu[-1] + len(new_tokens))
-            seq_ids.append(seq.seq_id)
-            seq_lens.append(start)
-
-        input_ids = torch.tensor(flat_tokens, dtype=torch.int64, device=self.device)
-        position_ids = torch.tensor(flat_positions, dtype=torch.int32, device=self.device)
-        cu_seqlens = torch.tensor(cu, dtype=torch.int32, device=self.device)
-        return input_ids, position_ids, cu_seqlens, seq_ids, seq_lens
-
-    # ------------------------------------------------------------------
     # Step
     # ------------------------------------------------------------------
 
@@ -183,14 +141,17 @@ class LLMEngine:
         if not batch:
             return []
 
-        input_ids, position_ids, cu_seqlens, seq_ids, seq_lens = self._build_inputs(batch)
-
-        logits = self.model(
-            input_ids, position_ids, cu_seqlens, self.block_manager, seq_ids, seq_lens
+        # Each sequence contributes its uncached tokens (the whole prompt on
+        # prefill, one token on decode). Everything attention needs is built
+        # here, once, and shared by every layer.
+        input_ids, position_ids, attn_metadata = build_step_inputs(
+            batch, self.block_manager, self.device
         )
 
+        logits = self.model(input_ids, position_ids, attn_metadata, self.block_manager)
+
         # Logits for the last position of each packed segment.
-        last_idx = cu_seqlens[1:].long() - 1
+        last_idx = attn_metadata.cu_seqlens_q[1:].long() - 1
         last_logits = logits[last_idx]  # [num_seqs, vocab_size]
 
         for i, seq in enumerate(batch):

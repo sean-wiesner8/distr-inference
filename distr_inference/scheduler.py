@@ -104,9 +104,8 @@ class Scheduler:
         Select the sequences to run this step (mixed prefill + decode).
 
         Returns them in batch order — the order the engine must use to pack
-        ``input_ids`` / ``cu_seqlens`` / ``seq_ids`` / ``seq_lens``. Every
-        returned sequence has enough KV blocks allocated to hold ``seq_len``
-        tokens.
+        ``input_ids`` and the attention metadata. Every returned sequence has
+        enough KV blocks allocated to hold ``seq_len`` tokens.
         """
         bm = self.block_manager
         batch: List[Sequence] = []

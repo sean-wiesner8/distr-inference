@@ -18,13 +18,12 @@ Typical usage
         rotary_emb=rope_module,
     )
 
+    input_ids, position_ids, attn_metadata = build_step_inputs(batch, block_manager, device)
     out = attn(
         hidden_states,   # [total_tokens, hidden]
         position_ids,    # [total_tokens]
-        cu_seqlens,      # [num_seqs + 1]
+        attn_metadata,   # AttentionMetadata, built once per step
         block_manager,
-        seq_ids,
-        seq_lens,
     )
 """
 
@@ -36,6 +35,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 
+from .attention_metadata import AttentionMetadata
 from .block_manager import BlockManager
 
 
@@ -209,10 +209,10 @@ class PagedAttention(nn.Module):
         self,
         k: torch.Tensor,
         v: torch.Tensor,
-        cu_seqlens: torch.Tensor,
+        cu_seqlens: List[int],
         block_manager: BlockManager,
         seq_ids: List[int],
-        seq_lens_before: List[int],
+        num_cached: List[int],
     ) -> None:
         """
         Scatter K/V tokens from the 1-D buffer into the paged KV cache.
@@ -222,14 +222,14 @@ class PagedAttention(nn.Module):
 
         Parameters
         ----------
-        k              : [total_tokens, num_kv_heads, head_dim]
-        v              : [total_tokens, num_kv_heads, head_dim]
-        cu_seqlens     : int32 tensor of cumulative token counts (len num_seqs+1).
-        block_manager  : Shared physical KV cache block pool.
-        seq_ids        : Sequence ID for each batch element.
-        seq_lens_before: Number of tokens already in the cache *before* this
-                         step, per sequence. Used to compute the correct
-                         block/slot offsets for writes.
+        k             : [total_tokens, num_kv_heads, head_dim]
+        v             : [total_tokens, num_kv_heads, head_dim]
+        cu_seqlens    : Host-side cumulative token counts (len num_seqs+1).
+        block_manager : Shared physical KV cache block pool.
+        seq_ids       : Sequence ID for each batch element.
+        num_cached    : Number of tokens already in the cache *before* this
+                        step, per sequence. Used to compute the correct
+                        block/slot offsets for writes.
 
         Every sequence's blocks must already be allocated (the scheduler does
         this before the forward pass); this method never allocates.
@@ -237,16 +237,12 @@ class PagedAttention(nn.Module):
         bm = block_manager
         block_size = bm.config.block_size
 
-        # Pull cu_seqlens to the host once; indexing a GPU tensor per element
-        # below would force a device->host sync on every access.
-        cu = cu_seqlens.tolist()
-
         # TODO: Convert to a single fused kernel to reduce kernel launch overhead. Maybe use cache_ops.reshape_and_cache
         for i, sid in enumerate(seq_ids):
-            start = cu[i]
-            end = cu[i + 1]
+            start = cu_seqlens[i]
+            end = cu_seqlens[i + 1]
             num_new = end - start
-            base_pos = seq_lens_before[i]       # token position in the full sequence
+            base_pos = num_cached[i]            # token position in the full sequence
             block_ids = bm.get_block_ids(sid)
 
             for t in range(num_new):
@@ -324,10 +320,8 @@ class PagedAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
-        cu_seqlens: torch.Tensor,
+        attn_metadata: AttentionMetadata,
         block_manager: BlockManager,
-        seq_ids: List[int],
-        seq_lens: List[int],
     ) -> torch.Tensor:
         """
         Forward pass on a packed 1-D token buffer.
@@ -338,56 +332,42 @@ class PagedAttention(nn.Module):
             Packed token representations from all sequences in the batch.
         position_ids  : [total_tokens]
             Absolute position of each token within its sequence.
-        cu_seqlens    : [num_seqs + 1], int32
-            Cumulative token counts. Sequence *i* occupies
-            hidden_states[cu_seqlens[i] : cu_seqlens[i+1]].
+        attn_metadata : Per-step paged-attention inputs (block table, KV
+                        lengths, cumulative query lengths), built once by
+                        :func:`~distr_inference.attention_metadata.build_step_inputs`
+                        and shared unchanged by every layer.
         block_manager : Shared physical KV cache block pool.
-        seq_ids       : Sequence ID for each element in the batch.
-        seq_lens      : Number of tokens already cached *before* this step,
-                        per sequence.
 
         Returns
         -------
         out : [total_tokens, hidden]
         """
+        md = attn_metadata
+
         # --- 1. Project + rotary ---
         q, kv = self._project(hidden_states)
         k, v = kv[:, 0], kv[:, 1]     # [total_tokens, num_kv_heads, head_dim]
         q, k = self._apply_rotary(q, k, position_ids.unsqueeze(0))
 
         # --- 2. Write K/V into paged cache ---
-        self._write_kv_to_paged_cache(k, v, cu_seqlens, block_manager, seq_ids, seq_lens)
-
-        # --- 3. Build block table and compute total KV lengths (including new tokens) ---
-        input_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
-        total_seq_lens = [s + n for s, n in zip(seq_lens, input_lens)]
-        block_table = self._build_block_table_tensor(
-            block_manager, seq_ids, total_seq_lens, hidden_states.device,
+        self._write_kv_to_paged_cache(
+            k, v, md.cu_seqlens_cpu, block_manager, md.seq_ids, md.num_cached,
         )
 
-        # --- 4. Attention ---
-        max_seqlen_q = max(input_lens)
-        max_seqlen_k = max(total_seq_lens)
-
-        # Per-sequence KV lengths (cached + new). The paged path takes these as
-        # seqused_k rather than cumulative cu_seqlens_k.
-        seqused_k = torch.tensor(
-            total_seq_lens, device=hidden_states.device, dtype=torch.int32,
-        )
-
+        # --- 3. Attention ---
         # K/V are read directly from the contiguous paged cache by the kernel.
         k_cache, v_cache = block_manager.get_kv_cache(self.layer_idx)
 
         attn_out = self._attention(
             q, k_cache, v_cache,
-            cu_seqlens_q=cu_seqlens,
-            seqused_k=seqused_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            block_table=block_table,
+            cu_seqlens_q=md.cu_seqlens_q,
+            seqused_k=md.seqused_k,
+            max_seqlen_q=md.max_seqlen_q,
+            max_seqlen_k=md.max_seqlen_k,
+            block_table=md.block_table,
         )
 
-        # --- 5. Output projection ---
+        # --- 4. Output projection ---
         # attn_out: [total_tokens, num_heads, head_dim] → [total_tokens, hidden]
         attn_flat = attn_out.reshape(attn_out.shape[0], self.num_heads * self.head_dim)
         return self.o_proj(attn_flat)
