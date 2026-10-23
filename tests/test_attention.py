@@ -176,6 +176,13 @@ def test_apply_rotary_output_shapes():
 # Group 4: _write_kv_to_paged_cache
 # ---------------------------------------------------------------------------
 
+def _write(attn, bm, k, v, specs):
+    """Write ``k``/``v`` for the batch described by ``specs`` (see make_metadata)."""
+    _, md = make_metadata(bm, specs)
+    k_cache, v_cache = bm.get_kv_cache(attn.layer_idx)
+    attn._write_kv_to_paged_cache(k, v, k_cache, v_cache, md.slot_mapping)
+
+
 def test_write_kv_prefill_single_seq():
     """6 tokens into empty cache with block_size=4 → 2 blocks."""
     attn = make_paged_attention(layer_idx=0)
@@ -186,9 +193,8 @@ def test_write_kv_prefill_single_seq():
     num_tokens = 6
     k = torch.randn(num_tokens, NUM_KV_HEADS, HEAD_DIM)
     v = torch.randn(num_tokens, NUM_KV_HEADS, HEAD_DIM)
-    cu_seqlens = [0, num_tokens]
 
-    attn._write_kv_to_paged_cache(k, v, cu_seqlens, bm, seq_ids=[0], num_cached=[0])
+    _write(attn, bm, k, v, [(0, 0, num_tokens)])
 
     # Verify values in cache: first block full (4), second partial (2).
     table = bm.get_block_table(0)
@@ -209,9 +215,8 @@ def test_write_kv_single_token_decode():
 
     k_new = torch.randn(1, NUM_KV_HEADS, HEAD_DIM)
     v_new = torch.randn(1, NUM_KV_HEADS, HEAD_DIM)
-    cu_seqlens = [0, 1]
 
-    attn._write_kv_to_paged_cache(k_new, v_new, cu_seqlens, bm, seq_ids=[0], num_cached=[3])
+    _write(attn, bm, k_new, v_new, [(0, 3, 1)])
 
     # Still 1 block; the new token lands in its last slot.
     table = bm.get_block_table(0)
@@ -232,9 +237,8 @@ def test_write_kv_decode_crosses_block_boundary():
 
     k_new = torch.randn(1, NUM_KV_HEADS, HEAD_DIM)
     v_new = torch.randn(1, NUM_KV_HEADS, HEAD_DIM)
-    cu_seqlens = [0, 1]
 
-    attn._write_kv_to_paged_cache(k_new, v_new, cu_seqlens, bm, seq_ids=[0], num_cached=[4])
+    _write(attn, bm, k_new, v_new, [(0, 4, 1)])
 
     assert bm.num_blocks_for_sequence(0) == 2
     table = bm.get_block_table(0)
@@ -258,13 +262,8 @@ def test_write_kv_mixed_batch():
 
     k = torch.randn(4, NUM_KV_HEADS, HEAD_DIM)  # 3 + 1 tokens
     v = torch.randn(4, NUM_KV_HEADS, HEAD_DIM)
-    cu_seqlens = [0, 3, 4]
 
-    attn._write_kv_to_paged_cache(
-        k, v, cu_seqlens, bm,
-        seq_ids=[0, 1],
-        num_cached=[0, 5],
-    )
+    _write(attn, bm, k, v, [(0, 0, 3), (1, 5, 1)])
 
     k_cache, v_cache = bm.get_kv_cache(layer_idx=0)
 
@@ -292,9 +291,8 @@ def test_write_kv_spans_multiple_blocks():
     num_tokens = 9
     k = torch.randn(num_tokens, NUM_KV_HEADS, HEAD_DIM)
     v = torch.randn(num_tokens, NUM_KV_HEADS, HEAD_DIM)
-    cu_seqlens = [0, num_tokens]
 
-    attn._write_kv_to_paged_cache(k, v, cu_seqlens, bm, seq_ids=[0], num_cached=[0])
+    _write(attn, bm, k, v, [(0, 0, num_tokens)])
 
     assert bm.num_blocks_for_sequence(0) == 3
     table = bm.get_block_table(0)
@@ -305,19 +303,127 @@ def test_write_kv_spans_multiple_blocks():
         assert torch.allclose(v_cache[pid, t % BLOCK_SIZE], v[t])
 
 
-def test_write_kv_does_not_allocate():
-    """Allocation is the scheduler's job; writing past the block table must fail."""
+def test_write_kv_only_touches_own_layer():
+    """Writing layer 1 leaves layer 0's cache untouched."""
+    attn = make_paged_attention(layer_idx=1)
+    bm = make_manager()
+    bm.register_sequence(0)
+    bm.ensure_capacity(0, 5)
+
+    k = torch.randn(5, NUM_KV_HEADS, HEAD_DIM)
+    v = torch.randn(5, NUM_KV_HEADS, HEAD_DIM)
+
+    _write(attn, bm, k, v, [(0, 0, 5)])
+
+    k0, v0 = bm.get_kv_cache(layer_idx=0)
+    assert torch.all(k0 == 0)
+    assert torch.all(v0 == 0)
+    k1, _ = bm.get_kv_cache(layer_idx=1)
+    assert torch.allclose(k1[bm.get_block_table(0)[1], 0], k[4])
+
+
+def test_write_kv_accepts_non_contiguous_kv():
+    """k/v sliced from the fused [T, 2, H, D] projection are non-contiguous views."""
     attn = make_paged_attention(layer_idx=0)
     bm = make_manager()
     bm.register_sequence(0)
+    bm.ensure_capacity(0, 6)
 
-    k = torch.randn(1, NUM_KV_HEADS, HEAD_DIM)
-    v = torch.randn(1, NUM_KV_HEADS, HEAD_DIM)
-    cu_seqlens = [0, 1]
+    kv = torch.randn(6, 2, NUM_KV_HEADS, HEAD_DIM)
+    k, v = kv[:, 0], kv[:, 1]
+    assert not k.is_contiguous()
 
-    with pytest.raises(IndexError):
-        attn._write_kv_to_paged_cache(k, v, cu_seqlens, bm, seq_ids=[0], num_cached=[0])
-    assert bm.num_blocks_for_sequence(0) == 0
+    _write(attn, bm, k, v, [(0, 0, 6)])
+
+    k_cache, v_cache = bm.get_kv_cache(layer_idx=0)
+    pid = bm.get_block_table(0)[1]
+    assert torch.equal(k_cache[pid, 1], k[5])
+    assert torch.equal(v_cache[pid, 1], v[5])
+
+
+def test_write_kv_casts_to_cache_dtype():
+    """K/V in a different dtype than the cache are cast on write."""
+    attn = make_paged_attention(layer_idx=0)
+    bm = make_manager()
+    bm.register_sequence(0)
+    bm.ensure_capacity(0, 2)
+
+    k = torch.randn(2, NUM_KV_HEADS, HEAD_DIM, dtype=torch.float64)
+    v = torch.randn(2, NUM_KV_HEADS, HEAD_DIM, dtype=torch.float64)
+
+    _write(attn, bm, k, v, [(0, 0, 2)])
+
+    k_cache, v_cache = bm.get_kv_cache(layer_idx=0)
+    pid = bm.get_block_table(0)[0]
+    assert k_cache.dtype == torch.float32
+    assert torch.equal(k_cache[pid, 1], k[1].float())
+    assert torch.equal(v_cache[pid, 1], v[1].float())
+
+
+def _reference_write(bm, layer_idx, k, v, cu_seqlens, seq_ids, num_cached):
+    """
+    The original per-token cache write, kept as the reference the vectorized
+    ``index_copy_`` path must match exactly.
+    """
+    block_size = bm.config.block_size
+    for i, sid in enumerate(seq_ids):
+        start = cu_seqlens[i]
+        num_new = cu_seqlens[i + 1] - start
+        block_ids = bm.get_block_ids(sid)
+        for t in range(num_new):
+            abs_pos = num_cached[i] + t
+            physical_id = block_ids[abs_pos // block_size]
+            slot_idx = abs_pos % block_size
+            bm.k_cache[layer_idx, physical_id, slot_idx] = k[start + t]
+            bm.v_cache[layer_idx, physical_id, slot_idx] = v[start + t]
+
+
+def test_write_kv_matches_reference_loop():
+    """Vectorized write is bit-identical to the per-token loop on a random mixed batch."""
+    gen = torch.Generator().manual_seed(0)
+    layer_idx = 1
+    attn = make_paged_attention(layer_idx=layer_idx)
+
+    # (seq_id, num_cached, num_new): prefills, decodes, and chunks that start
+    # mid-block and cross block boundaries.
+    specs = [(3, 0, 7), (8, 5, 1), (1, 3, 6), (5, 8, 1), (2, 0, 1), (6, 11, 4)]
+    target = {sid: cached + new for sid, cached, new in specs}
+
+    bm_ref = make_manager(num_blocks=32)
+    bm_new = make_manager(num_blocks=32)
+    for bm in (bm_ref, bm_new):
+        for sid in target:
+            bm.register_sequence(sid)
+        # Grow round-robin, one block at a time, so each sequence's physical
+        # blocks are interleaved with the other sequences' blocks.
+        while any(bm.num_blocks_for_sequence(s) * BLOCK_SIZE < n for s, n in target.items()):
+            for sid, n in target.items():
+                if bm.num_blocks_for_sequence(sid) * BLOCK_SIZE < n:
+                    bm.allocate_block(sid)
+    for sid in target:
+        assert bm_ref.get_block_ids(sid) == bm_new.get_block_ids(sid)
+
+    # Same random contents in both caches beforehand, so the comparison also
+    # checks that slots outside the batch are left alone.
+    bm_new.k_cache.copy_(torch.randn(bm_new.k_cache.shape, generator=gen))
+    bm_new.v_cache.copy_(torch.randn(bm_new.v_cache.shape, generator=gen))
+    bm_ref.k_cache.copy_(bm_new.k_cache)
+    bm_ref.v_cache.copy_(bm_new.v_cache)
+
+    total = sum(new for _, _, new in specs)
+    k = torch.randn(total, NUM_KV_HEADS, HEAD_DIM, generator=gen)
+    v = torch.randn(total, NUM_KV_HEADS, HEAD_DIM, generator=gen)
+
+    _, md = make_metadata(bm_new, specs)
+    k_cache, v_cache = bm_new.get_kv_cache(layer_idx)
+    attn._write_kv_to_paged_cache(k, v, k_cache, v_cache, md.slot_mapping)
+
+    _reference_write(
+        bm_ref, layer_idx, k, v, md.cu_seqlens_cpu, md.seq_ids, md.num_cached,
+    )
+
+    assert torch.equal(bm_new.k_cache, bm_ref.k_cache)
+    assert torch.equal(bm_new.v_cache, bm_ref.v_cache)
 
 
 # ---------------------------------------------------------------------------

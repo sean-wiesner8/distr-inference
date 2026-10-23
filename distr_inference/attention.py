@@ -209,55 +209,41 @@ class PagedAttention(nn.Module):
         self,
         k: torch.Tensor,
         v: torch.Tensor,
-        cu_seqlens: List[int],
-        block_manager: BlockManager,
-        seq_ids: List[int],
-        num_cached: List[int],
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
     ) -> None:
         """
         Scatter K/V tokens from the 1-D buffer into the paged KV cache.
 
-        Each sequence contributes ``cu_seqlens[i+1] - cu_seqlens[i]`` new
-        tokens (multiple for prefill, one for decode).
+        The cache is viewed as a flat array of slots, ``[num_blocks *
+        block_size, num_kv_heads, head_dim]``, so token ``i`` lands at
+        ``slot_mapping[i] = physical_block * block_size + offset``. One
+        ``index_copy_`` per tensor writes the whole batch.
 
         Parameters
         ----------
-        k             : [total_tokens, num_kv_heads, head_dim]
-        v             : [total_tokens, num_kv_heads, head_dim]
-        cu_seqlens    : Host-side cumulative token counts (len num_seqs+1).
-        block_manager : Shared physical KV cache block pool.
-        seq_ids       : Sequence ID for each batch element.
-        num_cached    : Number of tokens already in the cache *before* this
-                        step, per sequence. Used to compute the correct
-                        block/slot offsets for writes.
+        k            : [total_tokens, num_kv_heads, head_dim]
+        v            : [total_tokens, num_kv_heads, head_dim]
+        k_cache      : [num_blocks, block_size, num_kv_heads, head_dim], this
+                       layer's view from ``BlockManager.get_kv_cache``.
+        v_cache      : Same shape as ``k_cache``.
+        slot_mapping : [total_tokens] int64 flat slot index per token, from
+                       :class:`~distr_inference.attention_metadata.AttentionMetadata`.
+                       Slots never repeat within a step (no prefix sharing),
+                       so the scatter is race-free.
 
         Every sequence's blocks must already be allocated (the scheduler does
-        this before the forward pass); this method never allocates.
+        this before the forward pass, and the metadata builder raises if a
+        slot is missing); this method never allocates.
         """
-        bm = block_manager
-        block_size = bm.config.block_size
-
-        # TODO: Convert to a single fused kernel to reduce kernel launch overhead. Maybe use cache_ops.reshape_and_cache
-        for i, sid in enumerate(seq_ids):
-            start = cu_seqlens[i]
-            end = cu_seqlens[i + 1]
-            num_new = end - start
-            base_pos = num_cached[i]            # token position in the full sequence
-            block_ids = bm.get_block_ids(sid)
-
-            for t in range(num_new):
-                abs_pos = base_pos + t
-                logical_idx = abs_pos // block_size
-                slot_idx = abs_pos % block_size
-
-                physical_id = block_ids[logical_idx]
-                bm.write_slot(
-                    physical_block_id=physical_id,
-                    slot_idx=slot_idx,
-                    layer_idx=self.layer_idx,
-                    k=k[start + t],
-                    v=v[start + t],
-                )
+        
+        num_slots = k_cache.shape[0] * k_cache.shape[1]
+        slot_shape = (num_slots, self.num_kv_heads, self.head_dim)
+        # index_copy_ requires matching dtypes; the projections may run in a
+        # different precision than the cache.
+        k_cache.view(slot_shape).index_copy_(0, slot_mapping, k.to(k_cache.dtype))
+        v_cache.view(slot_shape).index_copy_(0, slot_mapping, v.to(v_cache.dtype))
 
     # ------------------------------------------------------------------
     # Attention
@@ -350,14 +336,11 @@ class PagedAttention(nn.Module):
         q, k = self._apply_rotary(q, k, position_ids.unsqueeze(0))
 
         # --- 2. Write K/V into paged cache ---
-        self._write_kv_to_paged_cache(
-            k, v, md.cu_seqlens_cpu, block_manager, md.seq_ids, md.num_cached,
-        )
+        k_cache, v_cache = block_manager.get_kv_cache(self.layer_idx)
+        self._write_kv_to_paged_cache(k, v, k_cache, v_cache, md.slot_mapping)
 
         # --- 3. Attention ---
         # K/V are read directly from the contiguous paged cache by the kernel.
-        k_cache, v_cache = block_manager.get_kv_cache(self.layer_idx)
-
         attn_out = self._attention(
             q, k_cache, v_cache,
             cu_seqlens_q=md.cu_seqlens_q,
