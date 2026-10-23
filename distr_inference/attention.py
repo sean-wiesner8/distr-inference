@@ -29,8 +29,7 @@ Typical usage
 
 from __future__ import annotations
 
-import math
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -113,37 +112,6 @@ class PagedAttention(nn.Module):
         self.kv_proj = kv_proj
         self.o_proj = o_proj
         self.rotary_emb = rotary_emb
-
-    # ------------------------------------------------------------------
-    # Block-table helpers
-    # ------------------------------------------------------------------
-
-    def _build_block_table_tensor(
-        self,
-        block_manager: BlockManager,
-        seq_ids: List[int],
-        seq_lens: List[int],
-        device: torch.device,
-    ) -> torch.Tensor:
-        """
-        Build a [num_seqs, max_blocks_per_seq] int32 tensor of physical block
-        IDs from the block manager's per-sequence block tables.
-
-        Sequences with fewer blocks than the maximum are right-padded with -1.
-        """
-        block_size = block_manager.config.block_size
-        max_blocks = max(
-            math.ceil(slen / block_size) for slen in seq_lens
-        ) if seq_lens else 0
-
-        table = torch.full(
-            (len(seq_ids), max_blocks), -1, dtype=torch.int32, device=device,
-        )
-        for i, sid in enumerate(seq_ids):
-            bt = block_manager.get_block_table(sid)
-            for logical_idx, physical_id in bt.items():
-                table[i, logical_idx] = physical_id
-        return table
 
     # ------------------------------------------------------------------
     # Shared sub-operations

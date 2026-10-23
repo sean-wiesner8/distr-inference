@@ -76,16 +76,14 @@ class FakeRotaryEmb(nn.Module):
 def _register_and_prefill(bm: BlockManager, seq_id: int, num_tokens: int, layer_idx: int = 0):
     """Register a sequence and pre-populate its blocks in the cache."""
     bm.register_sequence(seq_id)
+    bm.ensure_capacity(seq_id, num_tokens)
     block_size = bm.config.block_size
+    block_ids = bm.get_block_ids(seq_id)
+    k_cache, v_cache = bm.get_kv_cache(layer_idx)
     for t in range(num_tokens):
-        logical_idx = t // block_size
-        slot_idx = t % block_size
-        if slot_idx == 0 and bm.num_blocks_for_sequence(seq_id) <= logical_idx:
-            bm.allocate_block(seq_id)
-        physical_id = bm.get_block_table(seq_id)[logical_idx]
-        k = torch.randn(NUM_KV_HEADS, HEAD_DIM)
-        v = torch.randn(NUM_KV_HEADS, HEAD_DIM)
-        bm.write_slot(physical_id, slot_idx, layer_idx, k, v)
+        physical_id = block_ids[t // block_size]
+        k_cache[physical_id, t % block_size] = torch.randn(NUM_KV_HEADS, HEAD_DIM)
+        v_cache[physical_id, t % block_size] = torch.randn(NUM_KV_HEADS, HEAD_DIM)
 
 
 def make_metadata(bm: BlockManager, specs, device="cpu"):
@@ -427,62 +425,7 @@ def test_write_kv_matches_reference_loop():
 
 
 # ---------------------------------------------------------------------------
-# Group 5: _build_block_table_tensor
-# ---------------------------------------------------------------------------
-
-def test_build_block_table_single_seq():
-    attn = make_paged_attention()
-    bm = make_manager()
-    bm.register_sequence(0)
-    bm.allocate_block(0)
-    bm.allocate_block(0)
-
-    table = attn._build_block_table_tensor(bm, seq_ids=[0], seq_lens=[8], device=torch.device("cpu"))
-
-    assert table.shape == (1, 2)
-    assert table.dtype == torch.int32
-
-    bt = bm.get_block_table(0)
-    assert table[0, 0].item() == bt[0]
-    assert table[0, 1].item() == bt[1]
-
-
-def test_build_block_table_padding():
-    attn = make_paged_attention()
-    bm = make_manager()
-
-    bm.register_sequence(0)
-    bm.allocate_block(0)
-    bm.allocate_block(0)
-    bm.allocate_block(0)
-
-    bm.register_sequence(1)
-    bm.allocate_block(1)
-
-    table = attn._build_block_table_tensor(
-        bm, seq_ids=[0, 1], seq_lens=[12, 3], device=torch.device("cpu"),
-    )
-
-    assert table.shape == (2, 3)
-    # Seq 1 has only 1 block; columns 1 and 2 should be padded with -1.
-    assert table[1, 1].item() == -1
-    assert table[1, 2].item() == -1
-
-
-def test_build_block_table_dtype_and_device():
-    attn = make_paged_attention()
-    bm = make_manager()
-    bm.register_sequence(0)
-    bm.allocate_block(0)
-
-    table = attn._build_block_table_tensor(bm, seq_ids=[0], seq_lens=[4], device=torch.device("cpu"))
-
-    assert table.dtype == torch.int32
-    assert table.device == torch.device("cpu")
-
-
-# ---------------------------------------------------------------------------
-# Group 6: forward with mocked attention (CPU, no flash-attn needed)
+# Group 5: forward with mocked attention (CPU, no flash-attn needed)
 # ---------------------------------------------------------------------------
 
 def _run_forward_mocked(attn, hidden_states, position_ids, md, bm, captured=None):
@@ -602,7 +545,7 @@ def test_forward_passes_metadata_through_unchanged():
 
 
 # ---------------------------------------------------------------------------
-# Group 7: GPU + flash-attn tests
+# Group 6: GPU + flash-attn tests
 # ---------------------------------------------------------------------------
 
 _has_cuda = torch.cuda.is_available()

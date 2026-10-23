@@ -8,7 +8,7 @@ via DISTR_INFERENCE_MODEL_ID) in three configurations:
   2. Batched — BATCH_SIZE prompts submitted together and decoded in the same
      forward passes.
   3. Long prompt — one LONG_PROMPT_TOKENS-token prompt generated alone. The
-     short prompts above are ~8 tokens, so prefill cost (per-token KV writes,
+     short prompts above are ~8 tokens, so prefill cost (KV cache writes,
      lm_head over every prompt position) is invisible in them; this run's
      TTFT is where prefill-side work shows up, and its ITL is decode against
      a long context.

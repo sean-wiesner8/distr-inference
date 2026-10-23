@@ -215,40 +215,21 @@ class BlockManager:
         return len(self._block_tables[seq_id])
 
     # ------------------------------------------------------------------
-    # Cache read / write
+    # Cache access
     # ------------------------------------------------------------------
 
     def get_kv_cache(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Return views of the K and V cache for a single layer.
 
+        The views share storage with the full cache, so writes through them
+        (``PagedAttention._write_kv_to_paged_cache``) update it in place.
+
         Returns
         -------
         (k, v) each of shape [num_blocks, block_size, num_kv_heads, head_dim]
         """
         return self.k_cache[layer_idx], self.v_cache[layer_idx]
-
-    def write_slot(
-        self,
-        physical_block_id: int,
-        slot_idx: int,
-        layer_idx: int,
-        k: torch.Tensor,
-        v: torch.Tensor,
-    ) -> None:
-        """
-        Write K/V for a single (block, slot, layer) triple.
-
-        Parameters
-        ----------
-        physical_block_id : Index into the cache's block dimension.
-        slot_idx          : Position within the block [0, block_size).
-        layer_idx         : Attention layer index.
-        k                 : [num_kv_heads, head_dim]
-        v                 : [num_kv_heads, head_dim]
-        """
-        self.k_cache[layer_idx, physical_block_id, slot_idx] = k
-        self.v_cache[layer_idx, physical_block_id, slot_idx] = v
 
     # ------------------------------------------------------------------
     # Dunder helpers

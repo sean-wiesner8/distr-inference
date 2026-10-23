@@ -192,10 +192,10 @@ def test_can_allocate():
 
 
 # ---------------------------------------------------------------------------
-# write_slot / get_kv_cache
+# get_kv_cache
 # ---------------------------------------------------------------------------
 
-def test_write_slot_and_read_back():
+def test_get_kv_cache_returns_writable_layer_views():
     manager = make_manager(num_blocks=4)
     manager.register_sequence(seq_id=0)
     manager.allocate_block(seq_id=0)
@@ -205,10 +205,14 @@ def test_write_slot_and_read_back():
     k = torch.randn(CONFIG.num_kv_heads, CONFIG.head_dim)
     v = torch.randn(CONFIG.num_kv_heads, CONFIG.head_dim)
 
-    manager.write_slot(physical_id, slot_idx=0, layer_idx=0, k=k, v=v)
-
-    k_layer, v_layer = manager.get_kv_cache(layer_idx=0)
+    k_layer, v_layer = manager.get_kv_cache(layer_idx=1)
     assert k_layer.shape == (4, CONFIG.block_size, CONFIG.num_kv_heads, CONFIG.head_dim)
-    assert torch.allclose(k_layer[physical_id, 0], k)
-    assert torch.allclose(v_layer[physical_id, 0], v)
+
+    # Writes through the views land in the backing cache for that layer only.
+    k_layer[physical_id, 0] = k
+    v_layer[physical_id, 0] = v
+    assert torch.equal(manager.k_cache[1, physical_id, 0], k)
+    assert torch.equal(manager.v_cache[1, physical_id, 0], v)
+    assert torch.all(manager.k_cache[0] == 0)
+    assert torch.all(manager.v_cache[0] == 0)
 
