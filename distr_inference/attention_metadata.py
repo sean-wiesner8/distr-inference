@@ -124,7 +124,13 @@ def build_step_inputs(
     block_size = block_manager.config.block_size
 
     # --- Per-sequence Python pass ---
+    # Positions and slots are built here as plain lists, not with CPU tensor
+    # ops: CPU repeat_interleave wakes the intra-op thread pool for any batch
+    # over one sequence, and the spinning workers starved the main thread,
+    # doubling batched decode ITL.
     flat_tokens: List[int] = []
+    positions: List[int] = []
+    slot_mapping: List[int] = []
     cu: List[int] = [0]
     seq_ids: List[int] = []
     num_cached: List[int] = []
@@ -159,31 +165,27 @@ def build_step_inputs(
             )
         block_rows.append(block_ids[:blocks_needed])
 
+        # The allocation check above guarantees block_ids covers every
+        # position below end.
+        positions.extend(range(start, end))
+        slot_mapping.extend(
+            block_ids[p // block_size] * block_size + p % block_size
+            for p in range(start, end)
+        )
+
     max_seqlen_q = max(num_new)
     max_seqlen_k = max(seqused)
-    total_tokens = cu[-1]
 
     # --- Block table (CPU) ---
     max_blocks = -(-max_seqlen_k // block_size)
     padded = [row + [BLOCK_TABLE_PAD] * (max_blocks - len(row)) for row in block_rows]
     block_table_cpu = torch.tensor(padded, dtype=torch.int32)
 
-    # --- Positions and slot mapping (vectorized, CPU) ---
-    num_new_t = torch.tensor(num_new)
-    seq_idx = torch.repeat_interleave(torch.arange(len(batch)), num_new_t)
-    offset = torch.arange(total_tokens) - torch.tensor(cu[:-1]).repeat_interleave(num_new_t)
-    positions = torch.tensor(num_cached).repeat_interleave(num_new_t) + offset
-
-    # Every gathered entry is a real block: the allocation check above
-    # guarantees row i covers all positions below seqused[i].
-    physical = block_table_cpu.long()[seq_idx, positions // block_size]
-    slot_mapping_cpu = physical * block_size + positions % block_size
-
     # --- Host -> device ---
     input_ids = _to_device(torch.tensor(flat_tokens, dtype=torch.int64), device)
-    position_ids = _to_device(positions.to(torch.int32), device)
+    position_ids = _to_device(torch.tensor(positions, dtype=torch.int32), device)
     attn_metadata = AttentionMetadata(
-        slot_mapping=_to_device(slot_mapping_cpu, device),
+        slot_mapping=_to_device(torch.tensor(slot_mapping, dtype=torch.int64), device),
         block_table=_to_device(block_table_cpu, device),
         cu_seqlens_q=_to_device(torch.tensor(cu, dtype=torch.int32), device),
         seqused_k=_to_device(torch.tensor(seqused, dtype=torch.int32), device),
