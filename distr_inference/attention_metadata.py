@@ -13,6 +13,7 @@ Kept free of model / engine imports so the builder can be tested on CPU.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import List, Tuple
 
@@ -27,6 +28,10 @@ from .sequence import Sequence
 # padding is never read in correct operation; if a bug ever reads it, -1 gives
 # an out-of-range access rather than silently reading a real (wrong) block.
 BLOCK_TABLE_PAD = -1
+
+# TEMPORARY A/B switch for the batched-decode regression: DISTR_SYNC_H2D=1
+# makes _to_device a plain synchronous copy, skipping pinned memory.
+_SYNC_H2D = os.environ.get("DISTR_SYNC_H2D") == "1"
 
 
 @dataclass(frozen=True)
@@ -87,7 +92,7 @@ def _to_device(t: torch.Tensor, device: torch.device) -> torch.Tensor:
     a synchronous copy). The caching host allocator keeps the pinned buffer
     alive until the copy completes. Pinning needs CUDA, so CPU is a plain move.
     """
-    if device.type == "cuda":
+    if device.type == "cuda" and not _SYNC_H2D:
         return t.pin_memory().to(device, non_blocking=True)
     return t.to(device)
 
