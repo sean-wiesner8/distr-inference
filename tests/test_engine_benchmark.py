@@ -13,6 +13,13 @@ via DISTR_INFERENCE_MODEL_ID) in three configurations:
      TTFT is where prefill-side work shows up, and its ITL is decode against
      a long context.
 
+A separate, opt-in sweep (test_batch_size_sweep) reruns the batched
+configuration at each size in BENCH_BATCH_SIZES and prints one row per size,
+to show how latency and throughput scale with the number of simultaneous
+requests. It is skipped unless that variable is set:
+
+    BENCH_BATCH_SIZES="1 2 4 8 16 32" pytest tests/test_engine_benchmark.py::test_batch_size_sweep -s -q
+
 Every configuration is warmed up once before it is timed. With CUDA lazy
 module loading, a kernel is loaded on its first use in the process, and each
 batch shape can pick different kernels — warming up only one shape leaves the
@@ -84,8 +91,9 @@ BATCH_SIZE = len(PROMPTS)
 MAX_TOKENS = 64
 LONG_PROMPT_TOKENS = 2000
 BLOCK_SIZE = 16
-# Sized for the largest run: the long prompt needs
-# ceil((2000 + 64) / 16) = 130 blocks; 8 short requests need ~40.
+# Sized for the largest fixed run: the long prompt needs
+# ceil((2000 + 64) / 16) = 130 blocks; 8 short requests need ~40. Sweep runs
+# that need more get a larger pool (see run_timed).
 NUM_BLOCKS = 256
 # Above LONG_PROMPT_TOKENS so the long prefill fits the step budget normally
 # rather than through the scheduler's oversized-prompt escape hatch.
@@ -115,7 +123,7 @@ def model(hf_cfg):
     return m
 
 
-def make_block_manager(hf_cfg):
+def make_block_manager(hf_cfg, num_blocks=NUM_BLOCKS):
     head_dim = getattr(hf_cfg, "head_dim", None) or hf_cfg.hidden_size // hf_cfg.num_attention_heads
     kv_cfg = KVBlockConfig(
         num_layers=hf_cfg.num_hidden_layers,
@@ -125,7 +133,7 @@ def make_block_manager(hf_cfg):
         dtype=DTYPE,
         device=str(DEVICE),
     )
-    return BlockManager(num_blocks=NUM_BLOCKS, config=kv_cfg)
+    return BlockManager(num_blocks=num_blocks, config=kv_cfg)
 
 
 def encode(tokenizer, prompt):
@@ -165,11 +173,14 @@ def run_timed(model, hf_cfg, prompt_ids):
         stepped.append(seq.seq_id)
         return default_sampler(seq, logits)
 
+    # Every request is admitted at once and keeps its blocks until it
+    # finishes, so the pool must hold all of them at full length.
+    blocks_needed = sum(-(-(len(ids) + MAX_TOKENS) // BLOCK_SIZE) for ids in prompt_ids)
     engine = LLMEngine.build(
         model,
-        make_block_manager(hf_cfg),
+        make_block_manager(hf_cfg, max(NUM_BLOCKS, blocks_needed)),
         SchedulerConfig(
-            max_num_seqs=BATCH_SIZE, max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
+            max_num_seqs=len(prompt_ids), max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
         ),
         device=DEVICE,
         sampler=recording_sampler,
@@ -244,7 +255,7 @@ def test_engine_benchmark(model, hf_cfg, tokenizer):
     prompt_ids = [encode(tokenizer, p) for p in PROMPTS]
     configs = {
         "single": prompt_ids[:1],
-        "batched": prompt_ids,
+        "batched": prompt_ids[:BATCH_SIZE],
         "long prompt": [long_prompt_ids(tokenizer, LONG_PROMPT_TOKENS)],
     }
 
@@ -273,3 +284,40 @@ def test_engine_benchmark(model, hf_cfg, tokenizer):
         f"batched throughput only {speedup:.2f}x single "
         f"(floor {MIN_BATCH_SPEEDUP}x):{report}"
     )
+
+
+def test_batch_size_sweep(model, hf_cfg, tokenizer):
+    sizes = [int(s) for s in os.environ.get("BENCH_BATCH_SIZES", "").split()]
+    if not sizes:
+        pytest.skip('set BENCH_BATCH_SIZES (e.g. "1 2 4 8 16 32") to run the sweep')
+
+    prompt_ids = [encode(tokenizer, p) for p in PROMPTS]
+    # Larger batches cycle through the short prompts, so every size decodes
+    # the same kind of request.
+    batches = {n: [prompt_ids[i % len(prompt_ids)] for i in range(n)] for n in sizes}
+
+    # Warm up every size first: each batch shape can pick different kernels.
+    for ids in batches.values():
+        run_timed(model, hf_cfg, ids)
+
+    results = {n: run_timed(model, hf_cfg, ids) for n, ids in batches.items()}
+
+    # Speedup is relative to the smallest size in the sweep (batch 1 if given).
+    base = results[min(sizes)][1]["throughput_tokens_per_sec"]
+    lines = [
+        "",
+        f"batch size sweep ({MAX_TOKENS} output tokens per request, "
+        f"speedup vs batch {min(sizes)})",
+        f"{'batch':>6}  {'TTFT mean':>10}  {'ITL mean':>9}  {'ITL p99':>8}  "
+        f"{'tok/s':>8}  {'speedup':>8}",
+    ]
+    for n, (per_request, agg) in results.items():
+        ttft = sum(m["ttft_ms"] for m in per_request) / len(per_request)
+        itl = sum(m["itl_mean_ms"] for m in per_request) / len(per_request)
+        p99 = max(m["itl_p99_ms"] for m in per_request)
+        tput = agg["throughput_tokens_per_sec"]
+        lines.append(
+            f"{n:>6}  {ttft:>7.2f} ms  {itl:>6.2f} ms  {p99:>5.2f} ms  "
+            f"{tput:>8.1f}  {tput / base:>7.2f}x"
+        )
+    print("\n".join(lines))  # visible with -s
